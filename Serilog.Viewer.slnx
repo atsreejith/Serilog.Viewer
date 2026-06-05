@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SampleHost/SampleHost.csproj" />
+    <Project Path="src/Serilog.Viewer/Serilog.Viewer.csproj" />
+    <Project Path="src/Serilog.Viewer.Realtime/Serilog.Viewer.Realtime.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Serilog.Viewer.Core.Tests/Serilog.Viewer.Core.Tests.csproj" />
+    <Project Path="tests/Serilog.Viewer.Integration.Tests/Serilog.Viewer.Integration.Tests.csproj" />
+  </Folder>
+</Solution>

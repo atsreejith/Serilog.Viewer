@@ -1,0 +1,63 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+    <RootNamespace>Serilog.Viewer</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <NoWarn>AD0001</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>Serilog.Viewer</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Sreejith</Authors>
+    <Description>A lightweight, embeddable log viewer for ASP.NET Core applications that use Serilog structured logging. Serves a modern React-based UI to browse, filter, and search log files directly from your running application.</Description>
+    <Copyright>Copyright (c) Sreejith 2026</Copyright>
+    <PackageProjectUrl>https://github.com/atsreejith/Serilog.Viewer</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/atsreejith/Serilog.Viewer</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>serilog logging log-viewer aspnetcore middleware structured-logs</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!-- Optional: run npm build before compiling (skipped when SkipReactBuild=true, e.g. in CI) -->
+  <Target Name="BuildReactApp" BeforeTargets="BeforeBuild"
+          Condition="'$(SkipReactBuild)' != 'true'">
+    <PropertyGroup>
+      <ReactDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\Serilog.Viewer.React'))</ReactDir>
+    </PropertyGroup>
+    <Message Text="Building React app at $(ReactDir)..." Importance="high" />
+    <Exec Command="npm install" WorkingDirectory="$(ReactDir)" StandardOutputImportance="low" />
+    <Exec Command="npm run build" WorkingDirectory="$(ReactDir)" StandardOutputImportance="normal" />
+  </Target>
+
+  <!--
+    Embed React dist files as assembly resources.
+    Split into two patterns (root and assets/) so that %(Filename)%(Extension)
+    well-known metadata evaluates correctly and produces unique LogicalNames.
+    Avoids MSB4120 (self-referential metadata) and the RecursiveDir batching issue.
+  -->
+  <PropertyGroup>
+    <ReactDistDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\Serilog.Viewer.React\dist'))</ReactDistDir>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(ReactDistDir)')">
+    <!-- Root-level files: index.html -->
+    <EmbeddedResource Include="$(ReactDistDir)\index.html"
+                      LogicalName="Serilog.Viewer.wwwroot.index.html" />
+    <!-- Assets subdirectory: hashed JS/CSS bundles -->
+    <EmbeddedResource Include="$(ReactDistDir)\assets\*"
+                      LogicalName="Serilog.Viewer.wwwroot.assets.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

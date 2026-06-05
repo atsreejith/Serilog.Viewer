@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <!-- Depends only on the core viewer package; SignalR comes via AspNetCore framework ref -->
+    <ProjectReference Include="..\Serilog.Viewer\Serilog.Viewer.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
+    <RootNamespace>Serilog.Viewer.Realtime</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>Serilog.Viewer.Realtime</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Sreejith</Authors>
+    <Description>SignalR-based real-time log tailing extension for Serilog.Viewer. Adds live log streaming to the embedded log viewer UI.</Description>
+    <Copyright>Copyright (c) Sreejith 2026</Copyright>
+    <PackageProjectUrl>https://github.com/atsreejith/Serilog.Viewer</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/atsreejith/Serilog.Viewer</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>serilog logging log-viewer aspnetcore realtime signalr live-tail</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>
