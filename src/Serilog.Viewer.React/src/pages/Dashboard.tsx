@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { api } from "@/services/api";
 import type { DashboardStats } from "@/types";
+import { LOG_LEVEL_HEX, LOG_LEVEL_CONFIG } from "@/constants/logLevels";
 
 function StatCard({
   label,
@@ -51,13 +52,6 @@ function StatCard({
     </div>
   );
 }
-
-const CHART_COLORS = {
-  error: "#f85149",
-  warning: "#d29922",
-  info: "#3fb950",
-  fatal: "#bc8cff",
-};
 
 export function Dashboard() {
   const { data: stats, isLoading } = useQuery<DashboardStats>({
@@ -94,25 +88,25 @@ export function Dashboard() {
           label="Total Logs"
           value={stats.totalLogs}
           icon={Database}
-          color="bg-[#58a6ff]/10 text-[#58a6ff]"
+          color={`${LOG_LEVEL_CONFIG.Debug.bg} ${LOG_LEVEL_CONFIG.Debug.color}`}
         />
         <StatCard
           label="Errors"
           value={stats.errors}
           icon={AlertCircle}
-          color="bg-[#f85149]/10 text-[#f85149]"
+          color={`${LOG_LEVEL_CONFIG.Error.bg} ${LOG_LEVEL_CONFIG.Error.color}`}
         />
         <StatCard
           label="Warnings"
           value={stats.warnings}
           icon={AlertTriangle}
-          color="bg-[#d29922]/10 text-[#d29922]"
+          color={`${LOG_LEVEL_CONFIG.Warning.bg} ${LOG_LEVEL_CONFIG.Warning.color}`}
         />
         <StatCard
           label="Fatal"
           value={stats.fatals}
           icon={Skull}
-          color="bg-[#bc8cff]/10 text-[#bc8cff]"
+          color={`${LOG_LEVEL_CONFIG.Fatal.bg} ${LOG_LEVEL_CONFIG.Fatal.color}`}
         />
         <StatCard
           label="Active Files"
@@ -141,13 +135,13 @@ export function Dashboard() {
                   borderRadius: 8,
                 }}
                 labelStyle={{ color: "#8b949e" }}
-                itemStyle={{ color: "#f85149" }}
+                itemStyle={{ color: LOG_LEVEL_HEX.Error }}
               />
               <Area
                 type="monotone"
                 dataKey="errors"
-                stroke="#f85149"
-                fill="#f85149"
+                stroke={LOG_LEVEL_HEX.Error}
+                fill={LOG_LEVEL_HEX.Error}
                 fillOpacity={0.15}
                 strokeWidth={2}
               />
@@ -172,11 +166,11 @@ export function Dashboard() {
                   borderRadius: 8,
                 }}
                 labelStyle={{ color: "#8b949e" }}
-                itemStyle={{ color: "#58a6ff" }}
+                itemStyle={{ color: LOG_LEVEL_HEX.Debug }}
               />
               <Bar
                 dataKey="logs"
-                fill="#58a6ff"
+                fill={LOG_LEVEL_HEX.Debug}
                 fillOpacity={0.8}
                 radius={[3, 3, 0, 0]}
               />
@@ -202,9 +196,18 @@ export function Dashboard() {
                 cy="45%"
                 outerRadius={70}
               >
-                {stats.logsByLevel.map((entry) => (
-                  <Cell key={entry.level} fill={entry.color} />
-                ))}
+                {stats.logsByLevel
+                  .filter((l) => l.count > 0)
+                  .map((entry) => (
+                    <Cell
+                      key={entry.level}
+                      fill={
+                        LOG_LEVEL_HEX[
+                          entry.level as keyof typeof LOG_LEVEL_HEX
+                        ] ?? entry.color
+                      }
+                    />
+                  ))}
               </Pie>
               <Tooltip
                 contentStyle={{
@@ -213,6 +216,7 @@ export function Dashboard() {
                   borderRadius: 8,
                 }}
                 labelStyle={{ color: "#8b949e" }}
+                itemStyle={{ color: "#e6edf3" }}
                 formatter={(value: number, name: string) => [
                   value.toLocaleString(),
                   name,

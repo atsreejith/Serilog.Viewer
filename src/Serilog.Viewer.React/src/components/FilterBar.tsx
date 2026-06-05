@@ -1,6 +1,7 @@
 import { Search, X, Filter } from "lucide-react";
 import { useAppStore } from "@/store/appStore";
 import type { LogLevel } from "@/types";
+import { LOG_LEVEL_CONFIG } from "@/constants/logLevels";
 
 const LEVELS: LogLevel[] = [
   "Verbose",
@@ -10,15 +11,6 @@ const LEVELS: LogLevel[] = [
   "Error",
   "Fatal",
 ];
-
-const LEVEL_COLORS: Record<LogLevel, string> = {
-  Verbose: "border-[#8b949e] text-[#8b949e]",
-  Debug: "border-[#58a6ff] text-[#58a6ff]",
-  Information: "border-[#3fb950] text-[#3fb950]",
-  Warning: "border-[#d29922] text-[#d29922]",
-  Error: "border-[#f85149] text-[#f85149]",
-  Fatal: "border-[#bc8cff] text-[#bc8cff]",
-};
 
 export function FilterBar() {
   const { filters, setFilter, resetFilters } = useAppStore();
@@ -67,7 +59,7 @@ export function FilterBar() {
             onClick={() => toggleLevel(level)}
             className={`px-2 py-1 text-[10px] font-mono font-semibold rounded border transition-colors ${
               filters.levels.includes(level)
-                ? `${LEVEL_COLORS[level]} bg-current/10`
+                ? `${LOG_LEVEL_CONFIG[level].borderText} bg-current/10`
                 : "border-[#30363d] text-[#484f58] hover:border-[#8b949e] hover:text-[#8b949e]"
             }`}
           >
