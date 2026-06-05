@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using Serilog.Viewer.Interfaces;
 using Serilog.Viewer.Models;
 using CoreLogLevel = Serilog.Viewer.Models.LogLevel;
@@ -97,13 +98,39 @@ public sealed class ClefLogParser : ILogParser
         };
     }
 
+    private static readonly Regex _templateToken =
+        new(@"\{(@|\$)?(?<name>[^{}:]+?)(?::(?<format>[^{}]+?))?\}", RegexOptions.Compiled);
+
     private static string ParseMessage(JsonElement root)
     {
         if (root.TryGetProperty("@m", out var m) && m.ValueKind == JsonValueKind.String)
             return m.GetString() ?? string.Empty;
-        if (root.TryGetProperty("@mt", out var mt) && mt.ValueKind == JsonValueKind.String)
-            return mt.GetString() ?? string.Empty;
-        return string.Empty;
+
+        if (!root.TryGetProperty("@mt", out var mt) || mt.ValueKind != JsonValueKind.String)
+            return string.Empty;
+
+        var template = mt.GetString() ?? string.Empty;
+
+        return _templateToken.Replace(
+            template,
+            match =>
+            {
+                var name = match.Groups["name"].Value;
+                if (root.TryGetProperty(name, out var prop))
+                {
+                    return prop.ValueKind switch
+                    {
+                        JsonValueKind.String => prop.GetString() ?? match.Value,
+                        JsonValueKind.Number => prop.GetRawText(),
+                        JsonValueKind.True => "true",
+                        JsonValueKind.False => "false",
+                        JsonValueKind.Null => "null",
+                        _ => prop.GetRawText(),
+                    };
+                }
+                return match.Value;
+            }
+        );
     }
 
     private static string? ParseString(JsonElement root, string key)
