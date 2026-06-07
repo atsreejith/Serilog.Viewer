@@ -24,10 +24,12 @@
     <PackageTags>serilog logging log-viewer aspnetcore middleware structured-logs</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>log-viewer-icon.png</PackageIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\Serilog.Viewer.React\src\log-viewer-icon.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <!-- Optional: run npm build before compiling (skipped when SkipReactBuild=true, e.g. in CI) -->
