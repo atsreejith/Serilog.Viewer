@@ -20,6 +20,13 @@ interface AppState {
   // App config
   liveTailEnabled: boolean
   setLiveTailEnabled: (enabled: boolean) => void
+  fileDownloadEnabled: boolean
+  fileDeleteEnabled: boolean
+  setConfig: (config: {
+    liveTailEnabled: boolean
+    fileDownloadEnabled?: boolean
+    fileDeleteEnabled?: boolean
+  }) => void
 
   // File browser
   files: LogFile[]
@@ -63,6 +70,14 @@ const defaultFilters: FilterState = {
 export const useAppStore = create<AppState>((set, get) => ({
   liveTailEnabled: false,
   setLiveTailEnabled: (enabled) => set({ liveTailEnabled: enabled }),
+  fileDownloadEnabled: true,
+  fileDeleteEnabled: false,
+  setConfig: (config) =>
+    set({
+      liveTailEnabled: config.liveTailEnabled,
+      fileDownloadEnabled: config.fileDownloadEnabled ?? true,
+      fileDeleteEnabled: config.fileDeleteEnabled ?? false,
+    }),
 
   files: [],
   setFiles: (files) => set({ files }),

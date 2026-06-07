@@ -94,6 +94,8 @@ All options are set via the `LogViewerOptions` lambda passed to `AddLogViewer`:
 | `Username` | `string?` | `null` | Username for Basic Auth (required when enabled) |
 | `Password` | `string?` | `null` | Password for Basic Auth (required when enabled) |
 | `AuthRealm` | `string` | `"Log Viewer"` | Realm shown in the browser's auth challenge dialog |
+| `EnableFileDownload` | `bool` | `true` | Allow downloading log files from the viewer UI and API |
+| `EnableFileDelete` | `bool` | `false` | Allow deleting log files from the viewer UI and API |
 
 ### Example — custom path and Basic Auth
 

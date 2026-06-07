@@ -37,6 +37,9 @@ internal static class LogViewerRouteRegistrar
         var api = endpoints.MapGroup($"{basePath}/api");
 
         api.MapGet("files", FilesHandler.GetFiles);
+        api.MapGet("files/{fileName}/download", FilesHandler.DownloadFile);
+        api.MapGet("files/download/{**fileName}", FilesHandler.DownloadFile);
+        api.MapDelete("files/{**fileName}", FilesHandler.DeleteFile);
         api.MapGet("logs", LogsHandler.GetLogs);
         api.MapGet("logs/stats", LogsHandler.GetStats);
         api.MapGet("search", LogsHandler.Search);
@@ -45,7 +48,18 @@ internal static class LogViewerRouteRegistrar
         api.MapPost("export/json", ExportHandler.ExportJson);
 
         // Config endpoint consumed by the React SPA
-        api.MapGet("config", () => Results.Ok(new { liveTailEnabled = options.LiveTailEnabled }));
+        api.MapGet(
+            "config",
+            () =>
+                Results.Ok(
+                    new
+                    {
+                        liveTailEnabled = options.LiveTailEnabled,
+                        fileDownloadEnabled = options.EnableFileDownload,
+                        fileDeleteEnabled = options.EnableFileDelete,
+                    }
+                )
+        );
 
         // Extension registrations (e.g. SignalR hub from Serilog.Viewer.Realtime)
         foreach (var registration in builder.EndpointRegistrations)

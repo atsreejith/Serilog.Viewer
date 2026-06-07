@@ -25,4 +25,13 @@ public sealed class LogViewerOptions
     /// Set automatically by Serilog.Viewer.Realtime when AddLogViewerRealtime() is called.
     /// </summary>
     public bool LiveTailEnabled { get; set; } = false;
+
+    /// <summary>Allow log files to be downloaded from the viewer UI and API.</summary>
+    public bool EnableFileDownload { get; set; } = true;
+
+    /// <summary>
+    /// Allow log files to be deleted from the viewer UI and API.
+    /// Disabled by default because this is a destructive operation.
+    /// </summary>
+    public bool EnableFileDelete { get; set; } = false;
 }

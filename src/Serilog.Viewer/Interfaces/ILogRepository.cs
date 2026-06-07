@@ -5,6 +5,8 @@ namespace Serilog.Viewer.Interfaces;
 public interface ILogRepository
 {
     Task<IReadOnlyList<LogFile>> GetFilesAsync(CancellationToken cancellationToken = default);
+    Task<LogFile?> GetFileAsync(string fileName, CancellationToken cancellationToken = default);
+    Task<bool> DeleteFileAsync(string fileName, CancellationToken cancellationToken = default);
     Task<PagedResult<LogEntry>> QueryAsync(
         LogQuery query,
         CancellationToken cancellationToken = default

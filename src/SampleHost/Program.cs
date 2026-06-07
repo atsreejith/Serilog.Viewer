@@ -31,6 +31,7 @@ builder.Services.AddLogViewer(options =>
     options.Username = "admin";
     options.Password = "admin";
     options.AuthRealm = "Serilog Viewer Sample";
+    options.EnableFileDelete = true;
 });
 
 // Uncomment to enable real-time log tailing (requires Serilog.Viewer.Realtime):

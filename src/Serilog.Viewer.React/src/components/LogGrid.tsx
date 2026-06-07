@@ -7,7 +7,14 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowUpDown, ChevronUp, ChevronDown, Download } from "lucide-react";
+import {
+  ArrowUpDown,
+  ChevronUp,
+  ChevronDown,
+  Download,
+  Timer,
+  MemoryStick,
+} from "lucide-react";
 import type { LogEntry } from "@/types";
 import { LevelBadge } from "./LevelBadge";
 import { Timestamp } from "./Timestamp";
@@ -46,6 +53,11 @@ export function LogGrid() {
     [data],
   );
   const totalCount = data?.pages[0]?.totalCount ?? 0;
+  const latestPage =
+    data?.pages && data.pages.length > 0
+      ? data.pages[data.pages.length - 1]
+      : undefined;
+  const performance = latestPage?.performance;
 
   function handleSort(col: string) {
     if (filters.sortBy === col) {
@@ -163,11 +175,11 @@ export function LogGrid() {
     <div className="flex flex-col h-full">
       {/* Toolbar */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-[#21262d] bg-[#0d1117] shrink-0">
-        <div className="text-xs text-[#8b949e]">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#8b949e]">
           {isLoading ? (
             <span className="animate-pulse">Loading…</span>
           ) : (
-            <>
+            <span>
               <span className="text-[#e6edf3] font-semibold">
                 {allRows.length.toLocaleString()}
               </span>
@@ -176,7 +188,19 @@ export function LogGrid() {
                 {totalCount.toLocaleString()}
               </span>
               <span> entries</span>
-            </>
+            </span>
+          )}
+          {!isLoading && performance && (
+            <span className="flex items-center gap-2 text-[11px] text-[#6e7681]">
+              <span className="flex items-center gap-1">
+                <Timer size={11} />
+                {performance.durationMs.toLocaleString()} ms
+              </span>
+              <span className="flex items-center gap-1">
+                <MemoryStick size={11} />
+                {performance.serverPeakMemoryFormatted}
+              </span>
+            </span>
           )}
         </div>
         <div className="flex items-center gap-2">

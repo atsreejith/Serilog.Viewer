@@ -68,6 +68,33 @@ public sealed class FileSystemLogRepository : ILogRepository
         return Task.FromResult<IReadOnlyList<LogFile>>(unique);
     }
 
+    public async Task<LogFile?> GetFileAsync(
+        string fileName,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (string.IsNullOrWhiteSpace(fileName) || !IsSafeRelativePath(fileName))
+            return null;
+
+        var files = await GetFilesAsync(cancellationToken);
+        return files.FirstOrDefault(f =>
+            string.Equals(f.Name, fileName, StringComparison.Ordinal)
+        );
+    }
+
+    public async Task<bool> DeleteFileAsync(
+        string fileName,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var file = await GetFileAsync(fileName, cancellationToken);
+        if (file is null)
+            return false;
+
+        File.Delete(file.FullPath);
+        return true;
+    }
+
     public async Task<PagedResult<LogEntry>> QueryAsync(
         LogQuery query,
         CancellationToken cancellationToken = default
@@ -359,7 +386,36 @@ public sealed class FileSystemLogRepository : ILogRepository
 
     private string? ResolveFilePath(string fileName)
     {
-        var path = Path.Combine(_logFolder, fileName);
+        if (string.IsNullOrWhiteSpace(fileName) || !IsSafeRelativePath(fileName))
+            return null;
+
+        var root = Path.GetFullPath(_logFolder);
+        var path = Path.GetFullPath(
+            Path.Combine(root, fileName.Replace('/', Path.DirectorySeparatorChar))
+        );
+
+        if (!IsWithinRoot(root, path))
+            return null;
+
         return File.Exists(path) ? path : null;
+    }
+
+    private static bool IsSafeRelativePath(string fileName)
+    {
+        if (Path.IsPathFullyQualified(fileName))
+            return false;
+
+        var parts = fileName.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries);
+        return parts.Length > 0 && !parts.Any(p => p is "." or "..");
+    }
+
+    private static bool IsWithinRoot(string root, string path)
+    {
+        var normalizedRoot = Path.TrimEndingDirectorySeparator(root);
+        return string.Equals(path, normalizedRoot, StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith(
+                normalizedRoot + Path.DirectorySeparatorChar,
+                StringComparison.OrdinalIgnoreCase
+            );
     }
 }

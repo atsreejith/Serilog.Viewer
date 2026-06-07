@@ -46,6 +46,23 @@ export const api = {
     return fetchJson(`${BASE}/details?fileName=${encodeURIComponent(fileName)}&offset=${offset}`)
   },
 
+  async downloadFile(fileName: string): Promise<void> {
+    const res = await fetch(`${BASE}/files/download/${encodeFilePath(fileName)}`)
+    if (!res.ok) throw new Error('Download failed')
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fileName.split('/').pop() || fileName
+    a.click()
+    URL.revokeObjectURL(url)
+  },
+
+  async deleteFile(fileName: string): Promise<void> {
+    const res = await fetch(`${BASE}/files/${encodeFilePath(fileName)}`, { method: 'DELETE' })
+    if (!res.ok) throw new Error('Delete failed')
+  },
+
   async exportCsv(query: LogQuery): Promise<void> {
     const res = await fetch(`${BASE}/export/csv?${buildParams(query)}`, { method: 'POST' })
     if (!res.ok) throw new Error('Export failed')
@@ -58,7 +75,11 @@ export const api = {
     URL.revokeObjectURL(url)
   },
 
-  getConfig(): Promise<{ liveTailEnabled: boolean }> {
+  getConfig(): Promise<{
+    liveTailEnabled: boolean
+    fileDownloadEnabled: boolean
+    fileDeleteEnabled: boolean
+  }> {
     return fetchJson(`${BASE}/config`)
   },
 
@@ -73,4 +94,8 @@ export const api = {
     a.click()
     URL.revokeObjectURL(url)
   },
+}
+
+function encodeFilePath(fileName: string): string {
+  return fileName.split('/').map(encodeURIComponent).join('/')
 }

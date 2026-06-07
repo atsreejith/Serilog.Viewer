@@ -15,14 +15,20 @@ const queryClient = new QueryClient({
 });
 
 function AppInner() {
-  const setLiveTailEnabled = useAppStore((s) => s.setLiveTailEnabled);
+  const setConfig = useAppStore((s) => s.setConfig);
 
   useEffect(() => {
     api
       .getConfig()
-      .then((cfg) => setLiveTailEnabled(cfg.liveTailEnabled))
-      .catch(() => setLiveTailEnabled(false));
-  }, [setLiveTailEnabled]);
+      .then((cfg) => setConfig(cfg))
+      .catch(() =>
+        setConfig({
+          liveTailEnabled: false,
+          fileDownloadEnabled: true,
+          fileDeleteEnabled: false,
+        }),
+      );
+  }, [setConfig]);
 
   return <RouterProvider router={router} />;
 }

@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Http;
 using Serilog.Viewer.Interfaces;
 using Serilog.Viewer.Models;
 using CoreLogLevel = Serilog.Viewer.Models.LogLevel;
+using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Serilog.Viewer.Handlers;
 
@@ -14,8 +15,27 @@ internal static class LogsHandler
     )
     {
         var query = BuildQuery(request);
+        var beforeMemory = GC.GetTotalMemory(forceFullCollection: false);
+        var start = Stopwatch.GetTimestamp();
         var result = await repository.QueryAsync(query, cancellationToken);
-        return Results.Ok(result);
+        var durationMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+        var afterMemory = GC.GetTotalMemory(forceFullCollection: false);
+
+        return Results.Ok(
+            new PagedResult<LogEntry>
+            {
+                Items = result.Items,
+                TotalCount = result.TotalCount,
+                Page = result.Page,
+                PageSize = result.PageSize,
+                Performance = new QueryPerformanceMetrics
+                {
+                    DurationMs = (long)Math.Round(durationMs),
+                    ServerPeakMemoryBytes = Math.Max(beforeMemory, afterMemory),
+                    ServerPeakMemoryFormatted = FormatBytes(Math.Max(beforeMemory, afterMemory)),
+                },
+            }
+        );
     }
 
     public static async Task<IResult> GetDetails(
@@ -108,5 +128,16 @@ internal static class LogsHandler
                 StringComparison.OrdinalIgnoreCase
             ),
         };
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes < 1024)
+            return $"{bytes} B";
+        if (bytes < 1024 * 1024)
+            return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024 * 1024 * 1024)
+            return $"{bytes / (1024.0 * 1024):F1} MB";
+        return $"{bytes / (1024.0 * 1024 * 1024):F2} GB";
     }
 }

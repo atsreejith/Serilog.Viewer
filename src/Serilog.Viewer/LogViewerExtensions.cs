@@ -33,6 +33,8 @@ public static class LogViewerExtensions
             o.Username = options.Username;
             o.Password = options.Password;
             o.AuthRealm = options.AuthRealm;
+            o.EnableFileDownload = options.EnableFileDownload;
+            o.EnableFileDelete = options.EnableFileDelete;
         });
 
         services.AddLogViewerInfrastructure(options.LogFolder);

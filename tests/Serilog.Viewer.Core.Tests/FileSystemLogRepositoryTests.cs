@@ -45,6 +45,54 @@ public class FileSystemLogRepositoryTests : IDisposable
     }
 
     [Fact]
+    public async Task GetFileAsync_ReturnsCreatedFile()
+    {
+        WriteClefFile(
+            "download.clef",
+            new[] { """{"@t":"2024-01-01T00:00:00Z","@l":"INF","@m":"hello"}""" }
+        );
+
+        var file = await _repo.GetFileAsync("download.clef", CancellationToken.None);
+
+        Assert.NotNull(file);
+        Assert.Equal("download.clef", file.Name);
+    }
+
+    [Theory]
+    [InlineData("../secret.clef")]
+    [InlineData("..\\secret.clef")]
+    [InlineData("nested/../../secret.clef")]
+    public async Task GetFileAsync_RejectsTraversal(string fileName)
+    {
+        var file = await _repo.GetFileAsync(fileName, CancellationToken.None);
+
+        Assert.Null(file);
+    }
+
+    [Fact]
+    public async Task DeleteFileAsync_RemovesCreatedFile()
+    {
+        WriteClefFile(
+            "delete.clef",
+            new[] { """{"@t":"2024-01-01T00:00:00Z","@l":"INF","@m":"hello"}""" }
+        );
+
+        var deleted = await _repo.DeleteFileAsync("delete.clef", CancellationToken.None);
+        var files = await _repo.GetFilesAsync(CancellationToken.None);
+
+        Assert.True(deleted);
+        Assert.DoesNotContain(files, f => f.Name == "delete.clef");
+    }
+
+    [Fact]
+    public async Task DeleteFileAsync_RejectsTraversal()
+    {
+        var deleted = await _repo.DeleteFileAsync("../secret.clef", CancellationToken.None);
+
+        Assert.False(deleted);
+    }
+
+    [Fact]
     public async Task QueryAsync_ReturnsParsedEntries()
     {
         WriteClefFile(

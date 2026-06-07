@@ -34,6 +34,13 @@ export interface PagedResult<T> {
   page: number
   pageSize: number
   hasNextPage: boolean
+  performance?: QueryPerformanceMetrics
+}
+
+export interface QueryPerformanceMetrics {
+  durationMs: number
+  serverPeakMemoryBytes: number
+  serverPeakMemoryFormatted: string
 }
 
 export interface LogQuery {
