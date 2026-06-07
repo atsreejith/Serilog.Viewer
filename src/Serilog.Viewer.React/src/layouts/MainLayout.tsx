@@ -15,6 +15,7 @@ export function MainLayout() {
   const navItems = liveTailEnabled
     ? [...BASE_NAV_ITEMS, LIVE_TAIL_NAV]
     : BASE_NAV_ITEMS;
+  const appVersion = `v${__APP_VERSION__}`;
 
   return (
     <div className="flex h-screen bg-[#0d1117] text-[#e6edf3] overflow-hidden">
@@ -47,6 +48,13 @@ export function MainLayout() {
         ))}
 
         <div className="flex-1" />
+
+        <div
+          title={`Version ${__APP_VERSION__}`}
+          className="text-[10px] leading-none font-medium text-[#6e7681]"
+        >
+          {appVersion}
+        </div>
 
         {/* GitHub link */}
         <a
