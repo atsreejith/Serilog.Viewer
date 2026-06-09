@@ -37,8 +37,10 @@ internal static class LogViewerRouteRegistrar
         var api = endpoints.MapGroup($"{basePath}/api");
 
         api.MapGet("files", FilesHandler.GetFiles);
+        api.MapGet("files/download", FilesHandler.DownloadFile);
         api.MapGet("files/{fileName}/download", FilesHandler.DownloadFile);
         api.MapGet("files/download/{**fileName}", FilesHandler.DownloadFile);
+        api.MapDelete("files", FilesHandler.DeleteFile);
         api.MapDelete("files/{**fileName}", FilesHandler.DeleteFile);
         api.MapGet("logs", LogsHandler.GetLogs);
         api.MapGet("logs/stats", LogsHandler.GetStats);

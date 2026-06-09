@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using Serilog.Viewer.Infrastructure.Indexing;
 using Serilog.Viewer.Infrastructure.Reading;
 using Serilog.Viewer.Interfaces;
 using Serilog.Viewer.Models;
@@ -16,6 +17,7 @@ public sealed class FileSystemLogRepository : ILogRepository
 
     private readonly string _logFolder;
     private readonly StreamingLogFileReader _reader;
+    private readonly LogFileIndexStore _indexStore;
     private readonly ILogger<FileSystemLogRepository> _logger;
 
     public FileSystemLogRepository(
@@ -23,9 +25,18 @@ public sealed class FileSystemLogRepository : ILogRepository
         StreamingLogFileReader reader,
         ILogger<FileSystemLogRepository> logger
     )
+        : this(logFolder, reader, new LogFileIndexStore(logFolder, reader), logger) { }
+
+    internal FileSystemLogRepository(
+        string logFolder,
+        StreamingLogFileReader reader,
+        LogFileIndexStore indexStore,
+        ILogger<FileSystemLogRepository> logger
+    )
     {
         _logFolder = logFolder;
         _reader = reader;
+        _indexStore = indexStore;
         _logger = logger;
     }
 
@@ -100,29 +111,70 @@ public sealed class FileSystemLogRepository : ILogRepository
         CancellationToken cancellationToken = default
     )
     {
-        var allEntries = new List<LogEntry>();
-        await foreach (var entry in StreamAsync(query, cancellationToken))
-            allEntries.Add(entry);
-
-        IEnumerable<LogEntry> sorted = query.SortBy.ToUpperInvariant() switch
+        var targetFiles = await GetTargetFilesAsync(query, cancellationToken);
+        if (targetFiles.Count == 0)
         {
-            "LEVEL" => query.SortDescending
-                ? allEntries.OrderByDescending(e => e.Level)
-                : allEntries.OrderBy(e => e.Level),
-            "MESSAGE" => query.SortDescending
-                ? allEntries.OrderByDescending(e => e.Message)
-                : allEntries.OrderBy(e => e.Message),
-            _ => query.SortDescending
-                ? allEntries.OrderByDescending(e => e.Timestamp)
-                : allEntries.OrderBy(e => e.Timestamp),
-        };
+            return new PagedResult<LogEntry>
+            {
+                Items = [],
+                TotalCount = 0,
+                Page = query.Page,
+                PageSize = query.PageSize,
+            };
+        }
 
-        var sortedList = sorted.ToList();
-        var total = sortedList.Count;
-        var paged = sortedList
-            .Skip((query.Page - 1) * query.PageSize)
-            .Take(query.PageSize)
-            .ToList();
+        try
+        {
+            var indexed = await _indexStore.QueryAsync(targetFiles, query, cancellationToken);
+            var items = new List<LogEntry>(indexed.Items.Count);
+
+            foreach (var pointer in indexed.Items)
+            {
+                var entry = await GetEntryAsync(pointer.FileName, pointer.Offset, cancellationToken);
+                if (entry is not null)
+                    items.Add(entry);
+            }
+
+            return new PagedResult<LogEntry>
+            {
+                Items = items,
+                TotalCount = indexed.TotalCount,
+                Page = query.Page,
+                PageSize = query.PageSize,
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Falling back to streaming log query because indexing failed");
+            return await QueryByStreamingAsync(targetFiles, query, cancellationToken);
+        }
+    }
+
+    private async Task<PagedResult<LogEntry>> QueryByStreamingAsync(
+        IReadOnlyList<LogFile> targetFiles,
+        LogQuery query,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var skip = Math.Max(0, query.Page - 1) * query.PageSize;
+        var retainCount = skip + query.PageSize;
+        var retained = new List<LogEntry>(Math.Min(retainCount, 4096));
+        var comparer = CreateQueryComparer(query);
+        var total = 0;
+
+        await foreach (var entry in StreamFilesAsync(targetFiles, query, cancellationToken))
+        {
+            if (total < int.MaxValue)
+                total++;
+
+            retained.Add(entry);
+            if (retained.Count >= retainCount * 2)
+                TrimRetainedEntries(retained, comparer, retainCount);
+        }
+
+        TrimRetainedEntries(retained, comparer, retainCount);
+
+        var paged = retained.Skip(skip).Take(query.PageSize).ToList();
 
         return new PagedResult<LogEntry>
         {
@@ -161,6 +213,24 @@ public sealed class FileSystemLogRepository : ILogRepository
             fileNames?.Count > 0
                 ? files.Where(f => fileNames.Contains(f.Name)).ToList()
                 : files.ToList();
+
+        try
+        {
+            return await _indexStore.GetStatsAsync(targetFiles, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Falling back to streaming dashboard stats because indexing failed");
+        }
+
+        return await GetStatsByStreamingAsync(targetFiles, cancellationToken);
+    }
+
+    private async Task<DashboardStats> GetStatsByStreamingAsync(
+        IReadOnlyList<LogFile> targetFiles,
+        CancellationToken cancellationToken
+    )
+    {
 
         long total = 0,
             errors = 0,
@@ -310,16 +380,34 @@ public sealed class FileSystemLogRepository : ILogRepository
             CancellationToken cancellationToken = default
     )
     {
+        var targetFiles = await GetTargetFilesAsync(query, cancellationToken);
+
+        await foreach (var entry in StreamFilesAsync(targetFiles, query, cancellationToken))
+            yield return entry;
+    }
+
+    private async Task<IReadOnlyList<LogFile>> GetTargetFilesAsync(
+        LogQuery query,
+        CancellationToken cancellationToken
+    )
+    {
         var files = await GetFilesAsync(cancellationToken);
 
-        IEnumerable<LogFile> targetFiles;
         if (query.FileNames?.Count > 0)
-            targetFiles = files.Where(f => query.FileNames.Contains(f.Name));
-        else if (!string.IsNullOrEmpty(query.FileName))
-            targetFiles = files.Where(f => f.Name == query.FileName);
-        else
-            targetFiles = files;
+            return files.Where(f => query.FileNames.Contains(f.Name)).ToList();
 
+        return !string.IsNullOrEmpty(query.FileName)
+            ? files.Where(f => f.Name == query.FileName).ToList()
+            : files.ToList();
+    }
+
+    private async IAsyncEnumerable<LogEntry> StreamFilesAsync(
+        IEnumerable<LogFile> targetFiles,
+        LogQuery query,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+            CancellationToken cancellationToken = default
+    )
+    {
         foreach (var file in targetFiles)
         {
             await foreach (var entry in _reader.ReadAsync(file.FullPath, cancellationToken))
@@ -382,6 +470,51 @@ public sealed class FileSystemLogRepository : ILogRepository
             return false;
 
         return true;
+    }
+
+    private static IComparer<LogEntry> CreateQueryComparer(LogQuery query) =>
+        Comparer<LogEntry>.Create(
+            (left, right) =>
+            {
+                var result = query.SortBy.ToUpperInvariant() switch
+                {
+                    "LEVEL" => left.Level.CompareTo(right.Level),
+                    "MESSAGE" => string.Compare(
+                        left.Message,
+                        right.Message,
+                        StringComparison.OrdinalIgnoreCase
+                    ),
+                    _ => left.Timestamp.CompareTo(right.Timestamp),
+                };
+
+                if (query.SortDescending)
+                    result = -result;
+
+                if (result != 0)
+                    return result;
+
+                result = string.Compare(left.FileName, right.FileName, StringComparison.Ordinal);
+                if (result != 0)
+                    return result;
+
+                return left.LineOffset.CompareTo(right.LineOffset);
+            }
+        );
+
+    private static void TrimRetainedEntries(
+        List<LogEntry> entries,
+        IComparer<LogEntry> comparer,
+        int retainCount
+    )
+    {
+        if (entries.Count <= retainCount)
+        {
+            entries.Sort(comparer);
+            return;
+        }
+
+        entries.Sort(comparer);
+        entries.RemoveRange(retainCount, entries.Count - retainCount);
     }
 
     private string? ResolveFilePath(string fileName)

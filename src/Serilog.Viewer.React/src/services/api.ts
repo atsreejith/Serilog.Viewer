@@ -47,19 +47,15 @@ export const api = {
   },
 
   async downloadFile(fileName: string): Promise<void> {
-    const res = await fetch(`${BASE}/files/download/${encodeFilePath(fileName)}`)
-    if (!res.ok) throw new Error('Download failed')
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
+    const url = `${BASE}/files/download?fileName=${encodeURIComponent(fileName)}`
     const a = document.createElement('a')
     a.href = url
     a.download = fileName.split('/').pop() || fileName
     a.click()
-    URL.revokeObjectURL(url)
   },
 
   async deleteFile(fileName: string): Promise<void> {
-    const res = await fetch(`${BASE}/files/${encodeFilePath(fileName)}`, { method: 'DELETE' })
+    const res = await fetch(`${BASE}/files?fileName=${encodeURIComponent(fileName)}`, { method: 'DELETE' })
     if (!res.ok) throw new Error('Delete failed')
   },
 
@@ -94,8 +90,4 @@ export const api = {
     a.click()
     URL.revokeObjectURL(url)
   },
-}
-
-function encodeFilePath(fileName: string): string {
-  return fileName.split('/').map(encodeURIComponent).join('/')
 }

@@ -31,6 +31,11 @@ public class FileSystemLogRepositoryTests : IDisposable
         File.WriteAllLines(Path.Combine(_tempDir, name), lines);
     }
 
+    private void AppendClefFile(string name, IEnumerable<string> lines)
+    {
+        File.AppendAllLines(Path.Combine(_tempDir, name), lines);
+    }
+
     [Fact]
     public async Task GetFilesAsync_ReturnsCreatedFile()
     {
@@ -157,6 +162,57 @@ public class FileSystemLogRepositoryTests : IDisposable
     }
 
     [Fact]
+    public async Task QueryAsync_PagesTimestampDescendingWithoutLoadingEveryRetainedEntry()
+    {
+        WriteClefFile(
+            "paging.clef",
+            Enumerable
+                .Range(0, 25)
+                .Select(i =>
+                    $$$"""{"@t":"2024-01-01T00:{{{i:D2}}}:00Z","@l":"INF","@m":"entry {{{i}}}"}"""
+                )
+        );
+
+        var result = await _repo.QueryAsync(
+            new LogQuery
+            {
+                Page = 2,
+                PageSize = 10,
+                SortBy = "Timestamp",
+                SortDescending = true,
+            },
+            CancellationToken.None
+        );
+
+        Assert.Equal(25, result.TotalCount);
+        Assert.Equal(10, result.Items.Count);
+        Assert.Equal("entry 14", result.Items[0].Message);
+        Assert.Equal("entry 5", result.Items[^1].Message);
+    }
+
+    [Fact]
+    public async Task QueryAsync_UpdatesIndexForAppendedEntries()
+    {
+        WriteClefFile(
+            "append.clef",
+            new[] { """{"@t":"2024-01-01T00:00:00Z","@l":"INF","@m":"first"}""" }
+        );
+
+        var first = await _repo.QueryAsync(new LogQuery { PageSize = 50 }, CancellationToken.None);
+
+        AppendClefFile(
+            "append.clef",
+            new[] { """{"@t":"2024-01-01T00:01:00Z","@l":"ERR","@m":"second"}""" }
+        );
+
+        var second = await _repo.QueryAsync(new LogQuery { PageSize = 50 }, CancellationToken.None);
+
+        Assert.Equal(1, first.TotalCount);
+        Assert.Equal(2, second.TotalCount);
+        Assert.Contains(second.Items, entry => entry.Message == "second");
+    }
+
+    [Fact]
     public async Task GetStatsAsync_ComputesTotalCount()
     {
         WriteClefFile(
@@ -170,6 +226,35 @@ public class FileSystemLogRepositoryTests : IDisposable
 
         var stats = await _repo.GetStatsAsync(cancellationToken: CancellationToken.None);
         Assert.Equal(10, stats.TotalLogs);
+    }
+
+    [Fact]
+    public async Task GetStatsAsync_UsesUpdatedIndexForAppendedEntries()
+    {
+        WriteClefFile(
+            "stats-append.clef",
+            new[]
+            {
+                """{"@t":"2024-01-01T00:00:00Z","@l":"INF","@m":"first","SourceContext":"App.One"}""",
+            }
+        );
+
+        var first = await _repo.GetStatsAsync(cancellationToken: CancellationToken.None);
+
+        AppendClefFile(
+            "stats-append.clef",
+            new[]
+            {
+                """{"@t":"2024-01-01T01:00:00Z","@l":"ERR","@m":"second","SourceContext":"App.Two"}""",
+            }
+        );
+
+        var second = await _repo.GetStatsAsync(cancellationToken: CancellationToken.None);
+
+        Assert.Equal(1, first.TotalLogs);
+        Assert.Equal(2, second.TotalLogs);
+        Assert.Equal(1, second.Errors);
+        Assert.Contains(second.TopSources, source => source.Source == "App.Two");
     }
 
     public void Dispose()

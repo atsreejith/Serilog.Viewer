@@ -26,7 +26,6 @@
 - **Live Tail** — real-time streaming of new log entries via SignalR (optional add-on)
 - **Multiple log formats** — parses plain-text (`.log`/`.txt`) and CLEF compact JSON (`.clef`/`.json`)
 - **Basic Authentication** — optional username/password gate for the `/logviewer` route
-- **Zero client dependencies** — the React SPA is bundled into the NuGet package and served as static assets; no separate frontend deployment needed
 - **Multi-framework** — targets .NET 8 and .NET 9
 
 ---

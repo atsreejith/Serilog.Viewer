@@ -73,7 +73,7 @@ export function LogDetailsDrawer({ entry, onClose }: LogDetailsDrawerProps) {
         {/* Message */}
         <Section title="Message">
           <p className="text-[#e6edf3] leading-relaxed font-mono text-xs break-words whitespace-pre-wrap">
-            {entry.renderedMessage ?? entry.message}
+            {entry.message}
           </p>
         </Section>
 
