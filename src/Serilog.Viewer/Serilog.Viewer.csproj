@@ -1,9 +1,13 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
+
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.8" />
+
   </ItemGroup>
+
 
   <PropertyGroup>
     <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
@@ -23,19 +27,28 @@
     <RepositoryUrl>https://github.com/atsreejith/Serilog.Viewer</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>serilog logging log-viewer aspnetcore middleware structured-logs</PackageTags>
+
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+
     <PackageReadmeFile>README.md</PackageReadmeFile>
+
     <PackageIcon>log-viewer-icon.png</PackageIcon>
+
   </PropertyGroup>
 
+
+
   <ItemGroup>
+
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+
     <None Include="..\Serilog.Viewer.React\src\log-viewer-icon.png" Pack="true" PackagePath="\" />
+
   </ItemGroup>
 
+
   <!-- Optional: run npm build before compiling (skipped when SkipReactBuild=true, e.g. in CI) -->
-  <Target Name="BuildReactApp" BeforeTargets="BeforeBuild"
-          Condition="'$(SkipReactBuild)' != 'true'">
+  <Target Name="BuildReactApp" BeforeTargets="BeforeBuild" Condition="'$(SkipReactBuild)' != 'true'">
     <PropertyGroup>
       <ReactDir>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\Serilog.Viewer.React'))</ReactDir>
     </PropertyGroup>
@@ -56,11 +69,9 @@
 
   <ItemGroup Condition="Exists('$(ReactDistDir)')">
     <!-- Root-level files: index.html -->
-    <EmbeddedResource Include="$(ReactDistDir)\index.html"
-                      LogicalName="Serilog.Viewer.wwwroot.index.html" />
+    <EmbeddedResource Include="$(ReactDistDir)\index.html" LogicalName="Serilog.Viewer.wwwroot.index.html" />
     <!-- Assets subdirectory: hashed JS/CSS bundles -->
-    <EmbeddedResource Include="$(ReactDistDir)\assets\*"
-                      LogicalName="Serilog.Viewer.wwwroot.assets.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="$(ReactDistDir)\assets\*" LogicalName="Serilog.Viewer.wwwroot.assets.%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>
