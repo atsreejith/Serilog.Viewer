@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import {
@@ -107,6 +107,7 @@ function FileRow({
 export function FileBrowser() {
   const queryClient = useQueryClient();
   const [busyFile, setBusyFile] = useState<string | null>(null);
+  const initializedDefaultSelection = useRef(false);
   const {
     data: files = [],
     refetch,
@@ -129,6 +130,20 @@ export function FileBrowser() {
   useEffect(() => {
     if (files.length > 0) setFiles(files);
   }, [files, setFiles]);
+
+  useEffect(() => {
+    if (initializedDefaultSelection.current || filters.selectedFiles.length > 0)
+      return;
+
+    const activeFiles = files.filter((file) => file.isActive);
+    if (activeFiles.length === 0) return;
+
+    initializedDefaultSelection.current = true;
+    setFilter(
+      "selectedFiles",
+      activeFiles.map((file) => file.name),
+    );
+  }, [files, filters.selectedFiles.length, setFilter]);
 
   const totalSize = files.reduce((sum, f) => sum + f.sizeBytes, 0);
   const activeCount = files.filter((f) => f.isActive).length;
