@@ -7,6 +7,7 @@ Directory.CreateDirectory(logFolder);
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Debug()
+    .WriteTo.Console()
     .WriteTo.File(
         new CompactJsonFormatter(),
         Path.Combine(logFolder, "log-.clef"),
