@@ -1,23 +1,40 @@
+using System.Diagnostics;
 using Microsoft.Data.Sqlite;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Serilog.Viewer.Infrastructure.Reading;
 using Serilog.Viewer.Models;
+using LogLevel = Serilog.Viewer.Models.LogLevel;
 
 namespace Serilog.Viewer.Infrastructure.Indexing;
 
 internal sealed class LogFileIndexStore
 {
-    private const int SchemaVersion = 1;
+    private const int SchemaVersion = 3;
+
+    /// <summary>
+    /// Maximum number of characters of a message retained in the index. The index only locates
+    /// entries — full text is re-read from the log file via the stored offset — so anything beyond
+    /// this is dead weight. Search matches against the retained prefix only.
+    /// </summary>
+    private const int MaxIndexedMessageLength = 512;
 
     private readonly string _databasePath;
     private readonly StreamingLogFileReader _reader;
+    private readonly ILogger _logger;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _initialized;
 
-    public LogFileIndexStore(string logFolder, StreamingLogFileReader reader)
+    public LogFileIndexStore(
+        string logFolder,
+        StreamingLogFileReader reader,
+        ILogger<LogFileIndexStore>? logger = null
+    )
     {
         var indexFolder = Path.Combine(logFolder, ".serilog-viewer");
         _databasePath = Path.Combine(indexFolder, "index.sqlite");
         _reader = reader;
+        _logger = logger ?? NullLogger<LogFileIndexStore>.Instance;
     }
 
     public async Task<IndexedQueryResult> QueryAsync(
@@ -37,8 +54,25 @@ internal sealed class LogFileIndexStore
             await using var connection = OpenConnection();
             await EnsureFilesIndexedAsync(connection, files, cancellationToken);
 
+            var countStarted = Stopwatch.GetTimestamp();
             var total = await CountAsync(connection, files, query, cancellationToken);
+            var countElapsed = Stopwatch.GetElapsedTime(countStarted);
+
+            var pageStarted = Stopwatch.GetTimestamp();
             var pointers = await GetPageAsync(connection, files, query, cancellationToken);
+            var pageElapsed = Stopwatch.GetElapsedTime(pageStarted);
+
+            _logger.LogDebug(
+                "Index query over {FileCount} file(s): count={CountMs} ms ({TotalCount} matches), page={PageMs} ms ({PointerCount} pointers, page {Page} size {PageSize}), search={HasSearchText}",
+                files.Count,
+                (long)countElapsed.TotalMilliseconds,
+                total,
+                (long)pageElapsed.TotalMilliseconds,
+                pointers.Count,
+                query.Page,
+                query.PageSize,
+                !string.IsNullOrWhiteSpace(query.SearchText)
+            );
 
             return new IndexedQueryResult(pointers, total);
         }
@@ -64,10 +98,30 @@ internal sealed class LogFileIndexStore
             await using var connection = OpenConnection();
             await EnsureFilesIndexedAsync(connection, files, cancellationToken);
 
+            var levelStarted = Stopwatch.GetTimestamp();
             var countsByLevel = await GetCountsByLevelAsync(connection, files, cancellationToken);
+            var levelElapsed = Stopwatch.GetElapsedTime(levelStarted);
+
+            var hourStarted = Stopwatch.GetTimestamp();
             var errorsByHour = await GetErrorsByHourAsync(connection, files, cancellationToken);
+            var hourElapsed = Stopwatch.GetElapsedTime(hourStarted);
+
+            var dayStarted = Stopwatch.GetTimestamp();
             var logsByDay = await GetLogsByDayAsync(connection, files, cancellationToken);
+            var dayElapsed = Stopwatch.GetElapsedTime(dayStarted);
+
+            var sourcesStarted = Stopwatch.GetTimestamp();
             var topSources = await GetTopSourcesAsync(connection, files, cancellationToken);
+            var sourcesElapsed = Stopwatch.GetElapsedTime(sourcesStarted);
+
+            _logger.LogDebug(
+                "Index stats over {FileCount} file(s): countsByLevel={CountsByLevelMs} ms, errorsByHour={ErrorsByHourMs} ms, logsByDay={LogsByDayMs} ms, topSources={TopSourcesMs} ms",
+                files.Count,
+                (long)levelElapsed.TotalMilliseconds,
+                (long)hourElapsed.TotalMilliseconds,
+                (long)dayElapsed.TotalMilliseconds,
+                (long)sourcesElapsed.TotalMilliseconds
+            );
 
             var verboses = countsByLevel.GetValueOrDefault(LogLevel.Verbose);
             var debugs = countsByLevel.GetValueOrDefault(LogLevel.Debug);
@@ -142,6 +196,7 @@ internal sealed class LogFileIndexStore
         if (_initialized)
             return;
 
+        var started = Stopwatch.GetTimestamp();
         Directory.CreateDirectory(Path.GetDirectoryName(_databasePath)!);
 
         await using var connection = OpenConnection();
@@ -151,6 +206,16 @@ internal sealed class LogFileIndexStore
         var currentVersion = await GetUserVersionAsync(connection, cancellationToken);
         if (currentVersion != SchemaVersion)
         {
+            if (currentVersion != 0)
+            {
+                _logger.LogDebug(
+                    "Index schema version {CurrentVersion} does not match expected {ExpectedVersion}; dropping and rebuilding the whole index at {DatabasePath}",
+                    currentVersion,
+                    SchemaVersion,
+                    _databasePath
+                );
+            }
+
             await ExecuteNonQueryAsync(connection, "DROP TABLE IF EXISTS entries;", cancellationToken);
             await ExecuteNonQueryAsync(connection, "DROP TABLE IF EXISTS files;", cancellationToken);
         }
@@ -210,9 +275,23 @@ internal sealed class LogFileIndexStore
             "CREATE INDEX IF NOT EXISTS ix_entries_level_time ON entries(level, timestamp_ticks);",
             cancellationToken
         );
+        // Leading source_context lets the dashboard's GROUP BY walk the index in order rather than
+        // scanning and sorting the table. file_id trails it to still serve file-filtered queries.
         await ExecuteNonQueryAsync(
             connection,
-            "CREATE INDEX IF NOT EXISTS ix_entries_source ON entries(source_context);",
+            "CREATE INDEX IF NOT EXISTS ix_entries_source_file ON entries(source_context, file_id);",
+            cancellationToken
+        );
+        // Same reasoning for the day/hour bucketing, which groups on a timestamp expression.
+        await ExecuteNonQueryAsync(
+            connection,
+            "CREATE INDEX IF NOT EXISTS ix_entries_time ON entries(timestamp_ticks);",
+            cancellationToken
+        );
+        // Same shape for the level aggregation.
+        await ExecuteNonQueryAsync(
+            connection,
+            "CREATE INDEX IF NOT EXISTS ix_entries_file_level ON entries(file_id, level);",
             cancellationToken
         );
         await ExecuteNonQueryAsync(
@@ -231,6 +310,12 @@ internal sealed class LogFileIndexStore
             cancellationToken
         );
 
+        _logger.LogDebug(
+            "Index schema ready in {ElapsedMs} ms at {DatabasePath}",
+            (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+            _databasePath
+        );
+
         _initialized = true;
     }
 
@@ -240,10 +325,18 @@ internal sealed class LogFileIndexStore
         CancellationToken cancellationToken
     )
     {
+        var ingestStarted = Stopwatch.GetTimestamp();
+        var filesRebuilt = 0;
+        var filesTailed = 0;
+        var filesSkipped = 0;
+        var totalEntries = 0L;
+        var totalBytes = 0L;
+
         foreach (var file in files)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
+            var fileStarted = Stopwatch.GetTimestamp();
             var state = await GetFileStateAsync(connection, file, cancellationToken);
             var currentLastWriteTicks = file.LastModified.UtcTicks;
             var startOffset = state?.LastScannedOffset ?? 0;
@@ -257,6 +350,25 @@ internal sealed class LogFileIndexStore
 
             if (rebuild)
             {
+                var reason =
+                    state is null ? "not-indexed"
+                    : !string.Equals(
+                        state.FullPath,
+                        file.FullPath,
+                        StringComparison.OrdinalIgnoreCase
+                    )
+                        ? "path-changed"
+                    : file.SizeBytes < startOffset ? "file-shrank"
+                    : "size-same-mtime-changed";
+
+                _logger.LogDebug(
+                    "Index rebuild for {LogFileName}: reason={RebuildReason}, size={FileSizeBytes} bytes, previously scanned {PreviouslyScannedBytes} bytes",
+                    file.Name,
+                    reason,
+                    file.SizeBytes,
+                    startOffset
+                );
+
                 await DeleteFileIndexAsync(connection, file.Name, cancellationToken);
                 state = await UpsertFileAsync(
                     connection,
@@ -266,10 +378,16 @@ internal sealed class LogFileIndexStore
                 );
                 startOffset = 0;
                 nextSeq = 0;
+                filesRebuilt++;
             }
             else if (file.SizeBytes == state!.SizeBytes && startOffset == file.SizeBytes)
             {
+                filesSkipped++;
                 continue;
+            }
+            else
+            {
+                filesTailed++;
             }
 
             await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
@@ -314,16 +432,18 @@ internal sealed class LogFileIndexStore
             var correlationParam = insert.Parameters.Add("$correlation_id", SqliteType.Text);
             var requestParam = insert.Parameters.Add("$request_id", SqliteType.Text);
 
+            var entriesInserted = 0L;
             await foreach (
                 var entry in _reader.ReadFromOffsetAsync(file.FullPath, startOffset, cancellationToken)
             )
             {
+                entriesInserted++;
                 fileIdParam.Value = state.Id;
                 seqParam.Value = nextSeq++;
                 offsetParam.Value = entry.LineOffset;
                 timestampParam.Value = entry.Timestamp.UtcTicks;
                 levelParam.Value = (int)entry.Level;
-                messageParam.Value = entry.Message;
+                messageParam.Value = Truncate(entry.Message);
                 exceptionParam.Value = (object?)entry.Exception ?? DBNull.Value;
                 sourceParam.Value = (object?)entry.SourceContext ?? DBNull.Value;
                 correlationParam.Value = (object?)entry.CorrelationId ?? DBNull.Value;
@@ -341,6 +461,37 @@ internal sealed class LogFileIndexStore
                 cancellationToken
             );
             await transaction.CommitAsync(cancellationToken);
+
+            var bytesScanned = file.SizeBytes - startOffset;
+            totalEntries += entriesInserted;
+            totalBytes += bytesScanned;
+
+            var fileElapsed = Stopwatch.GetElapsedTime(fileStarted);
+            _logger.LogDebug(
+                "Indexed {LogFileName} in {ElapsedMs} ms: mode={IndexMode}, {EntriesInserted} entries, {BytesScanned} bytes from offset {StartOffset} ({EntriesPerSecond:F0} entries/sec)",
+                file.Name,
+                (long)fileElapsed.TotalMilliseconds,
+                rebuild ? "rebuild" : "tail",
+                entriesInserted,
+                bytesScanned,
+                startOffset,
+                entriesInserted / Math.Max(fileElapsed.TotalSeconds, 0.001)
+            );
+        }
+
+        var ingestElapsed = Stopwatch.GetElapsedTime(ingestStarted);
+        if (filesRebuilt > 0 || filesTailed > 0)
+        {
+            _logger.LogDebug(
+                "Index ingest completed in {ElapsedMs} ms: {FilesRebuilt} rebuilt, {FilesTailed} tailed, {FilesSkipped} up-to-date, {TotalEntries} entries, {TotalBytes} bytes ({EntriesPerSecond:F0} entries/sec)",
+                (long)ingestElapsed.TotalMilliseconds,
+                filesRebuilt,
+                filesTailed,
+                filesSkipped,
+                totalEntries,
+                totalBytes,
+                totalEntries / Math.Max(ingestElapsed.TotalSeconds, 0.001)
+            );
         }
     }
 
@@ -577,6 +728,12 @@ internal sealed class LogFileIndexStore
 
     private static string BuildFilePredicate(SqliteCommand command, IReadOnlyList<LogFile> files)
     {
+        // When every indexed file is selected — the dashboard's default — the subquery only asks
+        // whether each row belongs to a file it already belongs to. Skipping it lets SQLite use the
+        // file-leading indexes directly instead of materializing the id set per aggregation.
+        if (SelectsAllIndexedFiles(command, files))
+            return "1=1";
+
         var fileParameters = new List<string>(files.Count);
         for (var i = 0; i < files.Count; i++)
         {
@@ -586,6 +743,36 @@ internal sealed class LogFileIndexStore
         }
 
         return $"e.file_id IN (SELECT id FROM files WHERE name IN ({string.Join(",", fileParameters)}))";
+    }
+
+    /// <summary>
+    /// True when <paramref name="files"/> covers every file currently in the index. Compares the
+    /// actual name sets, not just counts: a stale row (e.g. a log file deleted from disk) would
+    /// otherwise let a partial selection match on count alone and silently widen the query.
+    /// </summary>
+    private static bool SelectsAllIndexedFiles(SqliteCommand command, IReadOnlyList<LogFile> files)
+    {
+        using var indexed = command.Connection!.CreateCommand();
+        indexed.Transaction = command.Transaction;
+        indexed.CommandText = "SELECT name FROM files;";
+
+        var indexedNames = new HashSet<string>(StringComparer.Ordinal);
+        using (var reader = indexed.ExecuteReader())
+        {
+            while (reader.Read())
+                indexedNames.Add(reader.GetString(0));
+        }
+
+        if (indexedNames.Count != files.Count)
+            return false;
+
+        foreach (var file in files)
+        {
+            if (!indexedNames.Contains(file.Name))
+                return false;
+        }
+
+        return true;
     }
 
     private static string BuildOrderBy(LogQuery query)
@@ -603,6 +790,11 @@ internal sealed class LogFileIndexStore
 
     private static string EscapeLike(string value) =>
         value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+
+    private static string Truncate(string value) =>
+        value.Length <= MaxIndexedMessageLength
+            ? value
+            : value[..MaxIndexedMessageLength];
 
     private async Task<FileIndexState?> GetFileStateAsync(
         SqliteConnection connection,

@@ -19,9 +19,11 @@ internal static class InfrastructureServiceExtensions
         services.AddSingleton<ILogParser, PlainTextLogParser>();
         services.AddSingleton<LogParserFactory>();
         services.AddSingleton<StreamingLogFileReader>();
-        services.AddSingleton(sp =>
-            new LogFileIndexStore(logFolder, sp.GetRequiredService<StreamingLogFileReader>())
-        );
+        services.AddSingleton(sp => new LogFileIndexStore(
+            logFolder,
+            sp.GetRequiredService<StreamingLogFileReader>(),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<LogFileIndexStore>>()
+        ));
         services.AddSingleton<ILogRepository>(sp =>
         {
             var reader = sp.GetRequiredService<StreamingLogFileReader>();

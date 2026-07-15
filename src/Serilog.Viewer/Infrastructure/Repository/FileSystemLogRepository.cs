@@ -26,6 +26,23 @@ public sealed class FileSystemLogRepository : ILogRepository
     )
         : this(logFolder, reader, new LogFileIndexStore(logFolder, reader), logger) { }
 
+    /// <summary>
+    /// Overload that also routes index diagnostics (timings, rebuild reasons) through
+    /// <paramref name="loggerFactory"/>. Enable Debug for
+    /// Serilog.Viewer.Infrastructure.Indexing.LogFileIndexStore to see them.
+    /// </summary>
+    public FileSystemLogRepository(
+        string logFolder,
+        StreamingLogFileReader reader,
+        ILoggerFactory loggerFactory
+    )
+        : this(
+            logFolder,
+            reader,
+            new LogFileIndexStore(logFolder, reader, loggerFactory.CreateLogger<LogFileIndexStore>()),
+            loggerFactory.CreateLogger<FileSystemLogRepository>()
+        ) { }
+
     internal FileSystemLogRepository(
         string logFolder,
         StreamingLogFileReader reader,
