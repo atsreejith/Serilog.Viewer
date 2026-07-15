@@ -19,7 +19,7 @@
 
   <PropertyGroup>
     <PackageId>Serilog.Viewer</PackageId>
-    <Version>1.3.0</Version>
+    <Version>1.3.1</Version>
     <Authors>Sreejith</Authors>
     <Description>A lightweight, embeddable log viewer for ASP.NET Core applications that use Serilog structured logging. Serves a modern React-based UI to browse, filter, and search log files directly from your running application.</Description>
     <Copyright>Copyright (c) Sreejith 2026</Copyright>
