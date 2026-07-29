@@ -134,15 +134,19 @@ export function FileBrowser() {
   useEffect(() => {
     if (initializedDefaultSelection.current || filters.selectedFiles.length > 0)
       return;
-
-    const activeFiles = files.filter((file) => file.isActive);
-    if (activeFiles.length === 0) return;
+    if (files.length === 0) return;
 
     initializedDefaultSelection.current = true;
-    setFilter(
-      "selectedFiles",
-      activeFiles.map((file) => file.name),
+
+    // Default to the single newest file (never load across all files on launch).
+    // Prefer an active file; otherwise fall back to the most recently modified.
+    const active = files.filter((file) => file.isActive);
+    const pool = active.length > 0 ? active : files;
+    const latest = pool.reduce((a, b) =>
+      new Date(a.lastModified) >= new Date(b.lastModified) ? a : b,
     );
+
+    setFilter("selectedFiles", [latest.name]);
   }, [files, filters.selectedFiles.length, setFilter]);
 
   const totalSize = files.reduce((sum, f) => sum + f.sizeBytes, 0);

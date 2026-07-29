@@ -11,7 +11,7 @@ namespace Serilog.Viewer.Infrastructure.Parsing;
 public sealed partial class PlainTextLogParser : ILogParser
 {
     [GeneratedRegex(
-        @"^(?<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Z]|[+-]\d{2}:\d{2})?)\s*\[?(?<level>VRB|DBG|INF|WRN|ERR|FTL|VERBOSE|DEBUG|INFORMATION|WARNING|ERROR|FATAL)\]?\s*(?<msg>.+)$",
+        @"^(?<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s?(?:[Zz]|[+-]\d{2}:?\d{2}))?)\s*\[?(?<level>VRB|DBG|INF|WRN|ERR|FTL|VERBOSE|DEBUG|INFORMATION|WARNING|ERROR|FATAL)\]?\s*(?<msg>.+)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled
     )]
     private static partial Regex LogLineRegex();

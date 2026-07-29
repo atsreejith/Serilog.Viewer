@@ -10,7 +10,7 @@ namespace Serilog.Viewer.Infrastructure.Indexing;
 
 internal sealed class LogFileIndexStore
 {
-    private const int SchemaVersion = 3;
+    private const int SchemaVersion = 4;
 
     /// <summary>
     /// Maximum number of characters of a message retained in the index. The index only locates
@@ -24,6 +24,12 @@ internal sealed class LogFileIndexStore
     private readonly ILogger _logger;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _initialized;
+
+    /// <summary>
+    /// File ids with a head backfill already in flight. Every query re-observes the pending
+    /// low-water mark, so without this each one would schedule a redundant duplicate backfill.
+    /// </summary>
+    private readonly HashSet<long> _activeBackfills = [];
 
     public LogFileIndexStore(
         string logFolder,
@@ -191,6 +197,81 @@ internal sealed class LogFileIndexStore
         }
     }
 
+    /// <summary>
+    /// Secondary indexes on <c>entries</c>. Declared once so schema creation and post-bulk-load
+    /// rebuild cannot drift apart. Order matters only for readability.
+    /// </summary>
+    private static readonly (string Name, string Ddl)[] _secondaryIndexes =
+    [
+        ("ux_entries_file_seq",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_file_seq ON entries(file_id, seq);"),
+        ("ux_entries_file_offset",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_file_offset ON entries(file_id, offset);"),
+        ("ix_entries_file_time",
+            "CREATE INDEX IF NOT EXISTS ix_entries_file_time ON entries(file_id, timestamp_ticks);"),
+        ("ix_entries_level_time",
+            "CREATE INDEX IF NOT EXISTS ix_entries_level_time ON entries(level, timestamp_ticks);"),
+        // Leading source_context lets the dashboard's GROUP BY walk the index in order rather than
+        // scanning and sorting the table. file_id trails it to still serve file-filtered queries.
+        ("ix_entries_source_file",
+            "CREATE INDEX IF NOT EXISTS ix_entries_source_file ON entries(source_context, file_id);"),
+        // Same reasoning for the day/hour bucketing, which groups on a timestamp expression.
+        ("ix_entries_time",
+            "CREATE INDEX IF NOT EXISTS ix_entries_time ON entries(timestamp_ticks);"),
+        // Same shape for the level aggregation.
+        ("ix_entries_file_level",
+            "CREATE INDEX IF NOT EXISTS ix_entries_file_level ON entries(file_id, level);"),
+        ("ix_entries_correlation",
+            "CREATE INDEX IF NOT EXISTS ix_entries_correlation ON entries(correlation_id);"),
+        ("ix_entries_request",
+            "CREATE INDEX IF NOT EXISTS ix_entries_request ON entries(request_id);"),
+    ];
+
+    /// <summary>
+    /// Full rebuilds of at least this many bytes drop the secondary indexes for the duration of the
+    /// insert and recreate them afterwards. Below this the drop/recreate overhead outweighs the
+    /// saved per-row index maintenance.
+    /// </summary>
+    private const long BulkLoadThresholdBytes = 8L * 1024 * 1024;
+
+    /// <summary>
+    /// Cold rebuilds of at least this many bytes are indexed tail-first: a window at the end of the
+    /// file is indexed and made queryable before the head is backfilled in the background. Below
+    /// this a full forward scan is fast enough that the added complexity buys nothing.
+    /// </summary>
+    private const long TailFirstThresholdBytes = 32L * 1024 * 1024;
+
+    /// <summary>
+    /// Size of the tail window indexed before the first query returns. Sized so the newest entries
+    /// cover far more than a first page at any realistic entry size, while staying small enough to
+    /// index in well under a second.
+    /// </summary>
+    private const long TailWindowBytes = 8L * 1024 * 1024;
+
+    /// <summary>
+    /// Bytes indexed per background backfill slice. The write lock is released between slices, so
+    /// this bounds how long an interactive query can be stuck behind the backfill.
+    /// </summary>
+    private const long HeadBackfillSliceBytes = 4L * 1024 * 1024;
+
+    private static async Task CreateSecondaryIndexesAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken
+    )
+    {
+        foreach (var (_, ddl) in _secondaryIndexes)
+            await ExecuteNonQueryAsync(connection, ddl, cancellationToken);
+    }
+
+    private static async Task DropSecondaryIndexesAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken
+    )
+    {
+        foreach (var (name, _) in _secondaryIndexes)
+            await ExecuteNonQueryAsync(connection, $"DROP INDEX IF EXISTS {name};", cancellationToken);
+    }
+
     private async Task InitializeAsync(CancellationToken cancellationToken)
     {
         if (_initialized)
@@ -230,7 +311,12 @@ internal sealed class LogFileIndexStore
                 size_bytes INTEGER NOT NULL,
                 last_write_ticks INTEGER NOT NULL,
                 last_scanned_offset INTEGER NOT NULL,
-                format TEXT NOT NULL
+                format TEXT NOT NULL,
+                -- Tail-first indexing: a large file is indexed from a window near the end
+                -- backwards, so the newest entries (what the default view shows) are queryable
+                -- almost immediately. head_scanned_offset is the low-water mark of that backfill:
+                -- bytes below it are not yet indexed. It equals 0 once the file is fully indexed.
+                head_scanned_offset INTEGER NOT NULL DEFAULT 0
             );
             """,
             cancellationToken
@@ -255,55 +341,7 @@ internal sealed class LogFileIndexStore
             """,
             cancellationToken
         );
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_file_seq ON entries(file_id, seq);",
-            cancellationToken
-        );
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_entries_file_offset ON entries(file_id, offset);",
-            cancellationToken
-        );
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE INDEX IF NOT EXISTS ix_entries_file_time ON entries(file_id, timestamp_ticks);",
-            cancellationToken
-        );
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE INDEX IF NOT EXISTS ix_entries_level_time ON entries(level, timestamp_ticks);",
-            cancellationToken
-        );
-        // Leading source_context lets the dashboard's GROUP BY walk the index in order rather than
-        // scanning and sorting the table. file_id trails it to still serve file-filtered queries.
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE INDEX IF NOT EXISTS ix_entries_source_file ON entries(source_context, file_id);",
-            cancellationToken
-        );
-        // Same reasoning for the day/hour bucketing, which groups on a timestamp expression.
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE INDEX IF NOT EXISTS ix_entries_time ON entries(timestamp_ticks);",
-            cancellationToken
-        );
-        // Same shape for the level aggregation.
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE INDEX IF NOT EXISTS ix_entries_file_level ON entries(file_id, level);",
-            cancellationToken
-        );
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE INDEX IF NOT EXISTS ix_entries_correlation ON entries(correlation_id);",
-            cancellationToken
-        );
-        await ExecuteNonQueryAsync(
-            connection,
-            "CREATE INDEX IF NOT EXISTS ix_entries_request ON entries(request_id);",
-            cancellationToken
-        );
+        await CreateSecondaryIndexesAsync(connection, cancellationToken);
         await ExecuteNonQueryAsync(
             connection,
             $"PRAGMA user_version={SchemaVersion};",
@@ -331,6 +369,7 @@ internal sealed class LogFileIndexStore
         var filesSkipped = 0;
         var totalEntries = 0L;
         var totalBytes = 0L;
+        var pendingBackfills = new List<PendingBackfill>();
 
         foreach (var file in files)
         {
@@ -382,6 +421,16 @@ internal sealed class LogFileIndexStore
             }
             else if (file.SizeBytes == state!.SizeBytes && startOffset == file.SizeBytes)
             {
+                // Fully tailed, but a tail-first backfill may have been interrupted (process exit,
+                // crash) leaving the head unindexed. head_scanned_offset survives restarts, so
+                // resume it rather than silently serving a partial index forever.
+                if (state.HeadScannedOffset > 0)
+                {
+                    pendingBackfills.Add(
+                        new PendingBackfill(file, state.Id, state.HeadScannedOffset)
+                    );
+                }
+
                 filesSkipped++;
                 continue;
             }
@@ -390,79 +439,69 @@ internal sealed class LogFileIndexStore
                 filesTailed++;
             }
 
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
-            await using var insert = connection.CreateCommand();
-            insert.Transaction = (SqliteTransaction)transaction;
-            insert.CommandText =
-                """
-                INSERT OR IGNORE INTO entries (
-                    file_id,
-                    seq,
-                    offset,
-                    timestamp_ticks,
-                    level,
-                    message,
-                    exception,
-                    source_context,
-                    correlation_id,
-                    request_id
-                )
-                VALUES (
-                    $file_id,
-                    $seq,
-                    $offset,
-                    $timestamp_ticks,
-                    $level,
-                    $message,
-                    $exception,
-                    $source_context,
-                    $correlation_id,
-                    $request_id
-                );
-                """;
+            // Cold rebuild of a large file: index a window at the END first. The default view is
+            // newest-first, so the entries a user actually waits for live at the tail — indexing
+            // forward from byte 0 makes them the last thing available. The head is backfilled
+            // afterwards and the file is queryable in between.
+            var bytesToScan = file.SizeBytes - startOffset;
+            var tailFirst = rebuild && bytesToScan >= TailFirstThresholdBytes;
 
-            var fileIdParam = insert.Parameters.Add("$file_id", SqliteType.Integer);
-            var seqParam = insert.Parameters.Add("$seq", SqliteType.Integer);
-            var offsetParam = insert.Parameters.Add("$offset", SqliteType.Integer);
-            var timestampParam = insert.Parameters.Add("$timestamp_ticks", SqliteType.Integer);
-            var levelParam = insert.Parameters.Add("$level", SqliteType.Integer);
-            var messageParam = insert.Parameters.Add("$message", SqliteType.Text);
-            var exceptionParam = insert.Parameters.Add("$exception", SqliteType.Text);
-            var sourceParam = insert.Parameters.Add("$source_context", SqliteType.Text);
-            var correlationParam = insert.Parameters.Add("$correlation_id", SqliteType.Text);
-            var requestParam = insert.Parameters.Add("$request_id", SqliteType.Text);
+            long ingestFrom = startOffset;
+            long headPending = 0;
 
-            var entriesInserted = 0L;
-            await foreach (
-                var entry in _reader.ReadFromOffsetAsync(file.FullPath, startOffset, cancellationToken)
-            )
+            if (tailFirst)
             {
-                entriesInserted++;
-                fileIdParam.Value = state.Id;
-                seqParam.Value = nextSeq++;
-                offsetParam.Value = entry.LineOffset;
-                timestampParam.Value = entry.Timestamp.UtcTicks;
-                levelParam.Value = (int)entry.Level;
-                messageParam.Value = Truncate(entry.Message);
-                exceptionParam.Value = (object?)entry.Exception ?? DBNull.Value;
-                sourceParam.Value = (object?)entry.SourceContext ?? DBNull.Value;
-                correlationParam.Value = (object?)entry.CorrelationId ?? DBNull.Value;
-                requestParam.Value = (object?)entry.RequestId ?? DBNull.Value;
+                var target = Math.Max(0, file.SizeBytes - TailWindowBytes);
+                ingestFrom = await StreamingLogFileReader.FindNextLineStartAsync(
+                    file.FullPath,
+                    target,
+                    cancellationToken
+                );
+                headPending = ingestFrom;
 
-                await insert.ExecuteNonQueryAsync(cancellationToken);
+                _logger.LogDebug(
+                    "Tail-first index for {LogFileName}: serving newest {TailBytes} bytes from offset {TailOffset}, {HeadBytes} bytes deferred to backfill",
+                    file.Name,
+                    file.SizeBytes - ingestFrom,
+                    ingestFrom,
+                    headPending
+                );
             }
 
-            await UpdateFileMetadataAsync(
+            // Bulk loads pay to maintain nine secondary indexes on every row. Profiling a 200 MB
+            // file showed scan+parse at ~3.5 s against ~61 s of insert time — almost all of it
+            // index maintenance. Dropping the secondary indexes for a full rebuild and recreating
+            // them from the sorted table afterwards is dramatically cheaper. Tail ingests append a
+            // handful of rows, so they keep the indexes live and skip this.
+            var bulkLoad = rebuild && bytesToScan >= BulkLoadThresholdBytes;
+            if (bulkLoad)
+                await DropSecondaryIndexesAsync(connection, cancellationToken);
+
+            var entriesInserted = await IngestRangeAsync(
                 connection,
-                (SqliteTransaction)transaction,
-                state.Id,
+                state,
                 file,
-                file.SizeBytes,
+                ingestFrom,
+                nextSeq,
+                headScannedOffset: headPending,
                 cancellationToken
             );
-            await transaction.CommitAsync(cancellationToken);
 
-            var bytesScanned = file.SizeBytes - startOffset;
+            if (bulkLoad)
+            {
+                var reindexStarted = Stopwatch.GetTimestamp();
+                await CreateSecondaryIndexesAsync(connection, cancellationToken);
+                _logger.LogDebug(
+                    "Rebuilt secondary indexes for {LogFileName} in {ElapsedMs} ms",
+                    file.Name,
+                    (long)Stopwatch.GetElapsedTime(reindexStarted).TotalMilliseconds
+                );
+            }
+
+            if (headPending > 0)
+                pendingBackfills.Add(new PendingBackfill(file, state.Id, headPending));
+
+            var bytesScanned = file.SizeBytes - ingestFrom;
             totalEntries += entriesInserted;
             totalBytes += bytesScanned;
 
@@ -471,10 +510,12 @@ internal sealed class LogFileIndexStore
                 "Indexed {LogFileName} in {ElapsedMs} ms: mode={IndexMode}, {EntriesInserted} entries, {BytesScanned} bytes from offset {StartOffset} ({EntriesPerSecond:F0} entries/sec)",
                 file.Name,
                 (long)fileElapsed.TotalMilliseconds,
-                rebuild ? "rebuild" : "tail",
+                tailFirst ? "tail-first"
+                    : rebuild ? "rebuild"
+                    : "tail",
                 entriesInserted,
                 bytesScanned,
-                startOffset,
+                ingestFrom,
                 entriesInserted / Math.Max(fileElapsed.TotalSeconds, 0.001)
             );
         }
@@ -493,7 +534,358 @@ internal sealed class LogFileIndexStore
                 totalEntries / Math.Max(ingestElapsed.TotalSeconds, 0.001)
             );
         }
+
+        // Called while holding _gate, so _activeBackfills is not contended here. Every query
+        // re-observes a pending low-water mark, so the set is what stops each one from scheduling
+        // a redundant duplicate.
+        foreach (var pending in pendingBackfills)
+        {
+            if (!_activeBackfills.Add(pending.FileId))
+                continue;
+
+            _logger.LogDebug(
+                "Starting head backfill for {LogFileName}: {HeadBytes} bytes still unindexed",
+                pending.File.Name,
+                pending.HeadEndOffset
+            );
+            ScheduleHeadBackfill(pending);
+        }
     }
+
+    /// <summary>
+    /// Indexes <paramref name="file"/> from <paramref name="fromOffset"/> to EOF, assigning
+    /// sequence numbers from <paramref name="startSeq"/>. Returns the number of rows written.
+    /// </summary>
+    private async Task<long> IngestRangeAsync(
+        SqliteConnection connection,
+        FileIndexState state,
+        LogFile file,
+        long fromOffset,
+        long startSeq,
+        long headScannedOffset,
+        CancellationToken cancellationToken
+    )
+    {
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await using var insert = connection.CreateCommand();
+        insert.Transaction = (SqliteTransaction)transaction;
+        insert.CommandText =
+            """
+            INSERT OR IGNORE INTO entries (
+                file_id,
+                seq,
+                offset,
+                timestamp_ticks,
+                level,
+                message,
+                exception,
+                source_context,
+                correlation_id,
+                request_id
+            )
+            VALUES (
+                $file_id,
+                $seq,
+                $offset,
+                $timestamp_ticks,
+                $level,
+                $message,
+                $exception,
+                $source_context,
+                $correlation_id,
+                $request_id
+            );
+            """;
+
+        var fileIdParam = insert.Parameters.Add("$file_id", SqliteType.Integer);
+        var seqParam = insert.Parameters.Add("$seq", SqliteType.Integer);
+        var offsetParam = insert.Parameters.Add("$offset", SqliteType.Integer);
+        var timestampParam = insert.Parameters.Add("$timestamp_ticks", SqliteType.Integer);
+        var levelParam = insert.Parameters.Add("$level", SqliteType.Integer);
+        var messageParam = insert.Parameters.Add("$message", SqliteType.Text);
+        var exceptionParam = insert.Parameters.Add("$exception", SqliteType.Text);
+        var sourceParam = insert.Parameters.Add("$source_context", SqliteType.Text);
+        var correlationParam = insert.Parameters.Add("$correlation_id", SqliteType.Text);
+        var requestParam = insert.Parameters.Add("$request_id", SqliteType.Text);
+
+        var nextSeq = startSeq;
+        var entriesInserted = 0L;
+        await foreach (
+            var entry in _reader.ReadFromOffsetAsync(file.FullPath, fromOffset, cancellationToken)
+        )
+        {
+            entriesInserted++;
+            fileIdParam.Value = state.Id;
+            seqParam.Value = nextSeq++;
+            offsetParam.Value = entry.LineOffset;
+            timestampParam.Value = entry.Timestamp.UtcTicks;
+            levelParam.Value = (int)entry.Level;
+            messageParam.Value = Truncate(entry.Message);
+            exceptionParam.Value = (object?)entry.Exception ?? DBNull.Value;
+            sourceParam.Value = (object?)entry.SourceContext ?? DBNull.Value;
+            correlationParam.Value = (object?)entry.CorrelationId ?? DBNull.Value;
+            requestParam.Value = (object?)entry.RequestId ?? DBNull.Value;
+
+            await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await UpdateFileMetadataAsync(
+            connection,
+            (SqliteTransaction)transaction,
+            state.Id,
+            file,
+            file.SizeBytes,
+            cancellationToken
+        );
+        await SetHeadScannedOffsetAsync(
+            connection,
+            (SqliteTransaction)transaction,
+            state.Id,
+            headScannedOffset,
+            cancellationToken
+        );
+        await transaction.CommitAsync(cancellationToken);
+
+        return entriesInserted;
+    }
+
+    /// <summary>
+    /// Indexes the head of a tail-first file in the background so the initial query can return as
+    /// soon as the tail window is written. Backfill rows use negative sequence numbers counting
+    /// down from -1, which keeps them ordered before the tail window without renumbering it.
+    /// </summary>
+    private void ScheduleHeadBackfill(PendingBackfill pending)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var started = Stopwatch.GetTimestamp();
+                var totalEntries = 0L;
+
+                // The backfill must never hold _gate for its whole run — that would block every
+                // query behind a minutes-long write. Instead it works in slices, taking the gate
+                // per slice and releasing it in between so interactive queries interleave. Each
+                // slice commits and advances head_scanned_offset, so progress survives a crash.
+                var cursor = pending.HeadEndOffset;
+                while (cursor > 0)
+                {
+                    await _gate.WaitAsync(CancellationToken.None);
+                    try
+                    {
+                        await using var connection = OpenConnection();
+                        var state = await GetFileStateByIdAsync(
+                            connection,
+                            pending.FileId,
+                            CancellationToken.None
+                        );
+
+                        // File was rebuilt or removed under us; the backfill is void.
+                        if (state is null || state.HeadScannedOffset != cursor)
+                            return;
+
+                        var slice = await IngestHeadSliceAsync(
+                            connection,
+                            state,
+                            pending.File,
+                            cursor,
+                            CancellationToken.None
+                        );
+
+                        totalEntries += slice.EntriesInserted;
+                        cursor = slice.NewHeadOffset;
+                    }
+                    finally
+                    {
+                        _gate.Release();
+                    }
+
+                    // Yield between slices so a waiting query wins the gate rather than racing a
+                    // backfill that would otherwise reacquire it immediately.
+                    await Task.Yield();
+                }
+
+                _logger.LogDebug(
+                    "Head backfill for {LogFileName} completed in {ElapsedMs} ms: {EntriesInserted} entries over {BytesScanned} bytes",
+                    pending.File.Name,
+                    (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                    totalEntries,
+                    pending.HeadEndOffset
+                );
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Head backfill failed for {LogFileName}; the file remains partially indexed and will resume on the next query",
+                    pending.File.Name
+                );
+            }
+            finally
+            {
+                // Release the in-flight marker so an interrupted or failed backfill can be
+                // rescheduled by a later query.
+                await _gate.WaitAsync(CancellationToken.None);
+                try
+                {
+                    _activeBackfills.Remove(pending.FileId);
+                }
+                finally
+                {
+                    _gate.Release();
+                }
+            }
+        });
+    }
+
+    /// <summary>
+    /// Indexes one slice of the unindexed head, working backwards from
+    /// <paramref name="endOffset"/>. Returns the rows written and the new low-water mark, which is
+    /// 0 once the head is fully indexed.
+    /// </summary>
+    private async Task<HeadSliceResult> IngestHeadSliceAsync(
+        SqliteConnection connection,
+        FileIndexState state,
+        LogFile file,
+        long endOffset,
+        CancellationToken cancellationToken
+    )
+    {
+        // Work backwards a slice at a time so the newest still-unindexed entries land first.
+        var target = Math.Max(0, endOffset - HeadBackfillSliceBytes);
+        var sliceStart = target == 0
+            ? 0
+            : await StreamingLogFileReader.FindNextLineStartAsync(
+                file.FullPath,
+                target,
+                cancellationToken
+            );
+
+        var inserted = await IngestHeadRangeAsync(
+            connection,
+            state,
+            file,
+            sliceStart,
+            endOffset,
+            cancellationToken
+        );
+
+        return new HeadSliceResult(inserted, sliceStart);
+    }
+
+    private readonly record struct HeadSliceResult(long EntriesInserted, long NewHeadOffset);
+
+    /// <summary>
+    /// Reads bytes [<paramref name="fromOffset"/>, <paramref name="endOffset"/>) and writes them
+    /// with negative sequence numbers so they precede the already-indexed tail window.
+    /// </summary>
+    private async Task<long> IngestHeadRangeAsync(
+        SqliteConnection connection,
+        FileIndexState state,
+        LogFile file,
+        long fromOffset,
+        long endOffset,
+        CancellationToken cancellationToken
+    )
+    {
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await using var insert = connection.CreateCommand();
+        insert.Transaction = (SqliteTransaction)transaction;
+        insert.CommandText =
+            """
+            INSERT OR IGNORE INTO entries (
+                file_id, seq, offset, timestamp_ticks, level,
+                message, exception, source_context, correlation_id, request_id
+            )
+            VALUES (
+                $file_id, $seq, $offset, $timestamp_ticks, $level,
+                $message, $exception, $source_context, $correlation_id, $request_id
+            );
+            """;
+
+        var fileIdParam = insert.Parameters.Add("$file_id", SqliteType.Integer);
+        var seqParam = insert.Parameters.Add("$seq", SqliteType.Integer);
+        var offsetParam = insert.Parameters.Add("$offset", SqliteType.Integer);
+        var timestampParam = insert.Parameters.Add("$timestamp_ticks", SqliteType.Integer);
+        var levelParam = insert.Parameters.Add("$level", SqliteType.Integer);
+        var messageParam = insert.Parameters.Add("$message", SqliteType.Text);
+        var exceptionParam = insert.Parameters.Add("$exception", SqliteType.Text);
+        var sourceParam = insert.Parameters.Add("$source_context", SqliteType.Text);
+        var correlationParam = insert.Parameters.Add("$correlation_id", SqliteType.Text);
+        var requestParam = insert.Parameters.Add("$request_id", SqliteType.Text);
+
+        // Negative sequence numbers keep head rows ordered before the tail window. Seeding from
+        // the current minimum keeps them unique across slices, which the ux_entries_file_seq
+        // unique index requires.
+        var seq = await GetMinSeqAsync(connection, state.Id, cancellationToken) - 1;
+
+        var entriesInserted = 0L;
+        await foreach (
+            var entry in _reader.ReadFromOffsetAsync(file.FullPath, fromOffset, cancellationToken)
+        )
+        {
+            if (entry.LineOffset >= endOffset)
+                break;
+
+            entriesInserted++;
+            fileIdParam.Value = state.Id;
+            seqParam.Value = seq--;
+            offsetParam.Value = entry.LineOffset;
+            timestampParam.Value = entry.Timestamp.UtcTicks;
+            levelParam.Value = (int)entry.Level;
+            messageParam.Value = Truncate(entry.Message);
+            exceptionParam.Value = (object?)entry.Exception ?? DBNull.Value;
+            sourceParam.Value = (object?)entry.SourceContext ?? DBNull.Value;
+            correlationParam.Value = (object?)entry.CorrelationId ?? DBNull.Value;
+            requestParam.Value = (object?)entry.RequestId ?? DBNull.Value;
+
+            await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        // Advance the low-water mark to the start of this slice, in the same transaction as the
+        // rows themselves. Reaching 0 means the head is fully indexed.
+        await SetHeadScannedOffsetAsync(
+            connection,
+            (SqliteTransaction)transaction,
+            state.Id,
+            fromOffset,
+            cancellationToken
+        );
+        await transaction.CommitAsync(cancellationToken);
+
+        return entriesInserted;
+    }
+
+    private static async Task<long> GetMinSeqAsync(
+        SqliteConnection connection,
+        long fileId,
+        CancellationToken cancellationToken
+    )
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COALESCE(MIN(seq), 0) FROM entries WHERE file_id = $id;";
+        command.Parameters.AddWithValue("$id", fileId);
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt64(result);
+    }
+
+    private static async Task SetHeadScannedOffsetAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        long fileId,
+        long headScannedOffset,
+        CancellationToken cancellationToken
+    )
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "UPDATE files SET head_scanned_offset = $head WHERE id = $id;";
+        command.Parameters.AddWithValue("$head", headScannedOffset);
+        command.Parameters.AddWithValue("$id", fileId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private sealed record PendingBackfill(LogFile File, long FileId, long HeadEndOffset);
 
     private async Task<int> CountAsync(
         SqliteConnection connection,
@@ -811,7 +1203,8 @@ internal sealed class LogFileIndexStore
                 f.size_bytes,
                 f.last_write_ticks,
                 f.last_scanned_offset,
-                COALESCE(MAX(e.seq) + 1, 0)
+                COALESCE(MAX(e.seq) + 1, 0),
+                f.head_scanned_offset
             FROM files f
             LEFT JOIN entries e ON e.file_id = f.id
             WHERE f.name = $name
@@ -829,7 +1222,47 @@ internal sealed class LogFileIndexStore
             reader.GetInt64(2),
             reader.GetInt64(3),
             reader.GetInt64(4),
-            reader.GetInt32(5)
+            reader.GetInt32(5),
+            reader.GetInt64(6)
+        );
+    }
+
+    private async Task<FileIndexState?> GetFileStateByIdAsync(
+        SqliteConnection connection,
+        long fileId,
+        CancellationToken cancellationToken
+    )
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT
+                f.id,
+                f.full_path,
+                f.size_bytes,
+                f.last_write_ticks,
+                f.last_scanned_offset,
+                COALESCE(MAX(e.seq) + 1, 0),
+                f.head_scanned_offset
+            FROM files f
+            LEFT JOIN entries e ON e.file_id = f.id
+            WHERE f.id = $id
+            GROUP BY f.id;
+            """;
+        command.Parameters.AddWithValue("$id", fileId);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+            return null;
+
+        return new FileIndexState(
+            reader.GetInt64(0),
+            reader.GetString(1),
+            reader.GetInt64(2),
+            reader.GetInt64(3),
+            reader.GetInt64(4),
+            reader.GetInt32(5),
+            reader.GetInt64(6)
         );
     }
 
@@ -864,7 +1297,10 @@ internal sealed class LogFileIndexStore
                 size_bytes = excluded.size_bytes,
                 last_write_ticks = excluded.last_write_ticks,
                 last_scanned_offset = excluded.last_scanned_offset,
-                format = excluded.format
+                format = excluded.format,
+                -- This is the rebuild path: any pending backfill from a previous tail-first load
+                -- is void, so clear the low-water mark rather than leaving it stale.
+                head_scanned_offset = 0
             RETURNING id, full_path, size_bytes, last_write_ticks, last_scanned_offset;
             """;
         command.Parameters.AddWithValue("$name", file.Name);
@@ -883,6 +1319,7 @@ internal sealed class LogFileIndexStore
             reader.GetInt64(2),
             reader.GetInt64(3),
             reader.GetInt64(4),
+            0,
             0
         );
     }
@@ -970,6 +1407,16 @@ internal sealed class LogFileIndexStore
             }.ToString()
         );
         connection.Open();
+
+        // synchronous and cache_size are per-connection, so setting them once during schema setup
+        // had no effect on the connections that actually do the work — those ran at the default
+        // FULL. journal_mode=WAL is persisted in the database file itself and is not repeated here.
+        using (var pragma = connection.CreateCommand())
+        {
+            pragma.CommandText = "PRAGMA synchronous=NORMAL; PRAGMA cache_size=-65536; PRAGMA temp_store=MEMORY;";
+            pragma.ExecuteNonQuery();
+        }
+
         return connection;
     }
 
@@ -979,7 +1426,13 @@ internal sealed class LogFileIndexStore
         long SizeBytes,
         long LastWriteTicks,
         long LastScannedOffset,
-        int NextSeq
+        int NextSeq,
+        /// <summary>
+        /// Low-water mark of a tail-first backfill: bytes below this are not yet indexed. Zero
+        /// means the file is fully indexed. A non-zero value surviving into a later session means
+        /// the backfill was interrupted and must be resumed.
+        /// </summary>
+        long HeadScannedOffset
     );
 }
 

@@ -128,6 +128,57 @@ public sealed class StreamingLogFileReader
         return Encoding.UTF8.GetString(bytes, offset, length);
     }
 
+    /// <summary>
+    /// Returns the offset of the first line boundary at or after <paramref name="targetOffset"/>.
+    /// <para>
+    /// Tail-first indexing starts reading from a byte offset chosen by size, which will usually
+    /// land mid-line. Reading from there would yield a truncated first line that the parser would
+    /// reject (or worse, misparse), so callers snap to the next real line start.
+    /// </para>
+    /// <para>
+    /// Returns the file length if no newline occurs after the target.
+    /// </para>
+    /// </summary>
+    public static async Task<long> FindNextLineStartAsync(
+        string filePath,
+        long targetOffset,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (targetOffset <= 0)
+            return 0;
+
+        await using var stream = new FileStream(
+            filePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 65536,
+            useAsync: true
+        );
+
+        if (targetOffset >= stream.Length)
+            return stream.Length;
+
+        stream.Seek(targetOffset, SeekOrigin.Begin);
+
+        var buffer = new byte[65536];
+        var position = targetOffset;
+
+        int bytesRead;
+        while ((bytesRead = await stream.ReadAsync(buffer, cancellationToken)) > 0)
+        {
+            for (var i = 0; i < bytesRead; i++)
+            {
+                if (buffer[i] == (byte)'\n')
+                    return position + i + 1;
+            }
+            position += bytesRead;
+        }
+
+        return stream.Length;
+    }
+
     public static long GetFileSize(string filePath)
     {
         var fi = new FileInfo(filePath);
