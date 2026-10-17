@@ -1,5 +1,7 @@
 import { X, Copy, ChevronDown, ChevronRight } from "lucide-react";
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { api } from "@/services/api";
 import type { LogEntry } from "@/types";
 import { LevelBadge } from "./LevelBadge";
 import { Timestamp } from "./Timestamp";
@@ -37,8 +39,23 @@ function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text).catch(() => {});
 }
 
-export function LogDetailsDrawer({ entry, onClose }: LogDetailsDrawerProps) {
-  if (!entry) return null;
+export function LogDetailsDrawer({
+  entry: selected,
+  onClose,
+}: LogDetailsDrawerProps) {
+  // Grid rows are built from the search index and carry no raw line or structured properties.
+  // Fetch the full entry from its file the first time it is opened; the file name and byte
+  // offset identify it exactly.
+  const needsDetails = !!selected && !selected.rawJson;
+  const { data: full, isLoading: loadingDetails } = useQuery<LogEntry>({
+    queryKey: ["details", selected?.fileName, selected?.lineOffset],
+    queryFn: () => api.getDetails(selected!.fileName, selected!.lineOffset),
+    enabled: needsDetails,
+    staleTime: Infinity,
+  });
+
+  if (!selected) return null;
+  const entry: LogEntry = needsDetails && full ? full : selected;
 
   const props = Object.entries(entry.properties ?? {}).filter(
     ([k]) =>
@@ -125,6 +142,12 @@ export function LogDetailsDrawer({ entry, onClose }: LogDetailsDrawerProps) {
               {entry.exception}
             </pre>
           </Section>
+        )}
+
+        {needsDetails && loadingDetails && (
+          <p className="text-[#484f58] text-xs animate-pulse">
+            Loading full entry…
+          </p>
         )}
 
         {/* Raw JSON */}

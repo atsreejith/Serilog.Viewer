@@ -62,6 +62,83 @@ public sealed class StreamingLogFileReader
         }
     }
 
+    /// <summary>
+    /// Parses the entries that start at each of <paramref name="offsets"/>, through a single open
+    /// stream, visiting offsets in ascending order. Returns one result per distinct offset; the
+    /// value is null when no parseable line starts there (file truncated or rewritten).
+    /// </summary>
+    public async Task<Dictionary<long, LogEntry?>> ReadEntriesAtOffsetsAsync(
+        string filePath,
+        IReadOnlyCollection<long> offsets,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var result = new Dictionary<long, LogEntry?>(offsets.Count);
+        if (offsets.Count == 0)
+            return result;
+
+        var fileName = Path.GetFileName(filePath);
+        ILogParser? parser = null;
+
+        await using var stream = new FileStream(
+            filePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 65536,
+            useAsync: true
+        );
+
+        var buffer = new byte[65536];
+        var lineBytes = new MemoryStream();
+
+        foreach (var offset in offsets.Distinct().OrderBy(o => o))
+        {
+            if (offset < 0 || offset >= stream.Length)
+            {
+                result[offset] = null;
+                continue;
+            }
+
+            stream.Seek(offset, SeekOrigin.Begin);
+            lineBytes.SetLength(0);
+
+            while (true)
+            {
+                var bytesRead = await stream.ReadAsync(buffer, cancellationToken);
+                if (bytesRead == 0)
+                    break;
+
+                var newline = Array.IndexOf(buffer, (byte)'\n', 0, bytesRead);
+                if (newline >= 0)
+                {
+                    lineBytes.Write(buffer, 0, newline);
+                    break;
+                }
+
+                lineBytes.Write(buffer, 0, bytesRead);
+            }
+
+            if (lineBytes.Length == 0)
+            {
+                result[offset] = null;
+                continue;
+            }
+
+            var line = DecodeLine(lineBytes, trimCarriageReturn: true);
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                result[offset] = null;
+                continue;
+            }
+
+            parser ??= _parserFactory.DetectParser(line);
+            result[offset] = parser.Parse(line, fileName, offset);
+        }
+
+        return result;
+    }
+
     private static async IAsyncEnumerable<(string Line, long Offset)> ReadLinesAsync(
         string filePath,
         long startOffset,

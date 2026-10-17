@@ -22,12 +22,14 @@ public static class RealtimeExtensions
         builder.Options.LiveTailEnabled = true;
 
         builder.Services.AddSignalR();
+        builder.Services.AddSingleton<LiveTailSubscriptions>();
 
         var logFolder = builder.Options.LogFolder;
         builder.Services.AddSingleton<LogTailBroadcastService>(sp => new LogTailBroadcastService(
             sp.GetRequiredService<ILogFileWatcher>(),
             sp.GetRequiredService<IHubContext<LogTailHub>>(),
             sp.GetRequiredService<ILogRepository>(),
+            sp.GetRequiredService<LiveTailSubscriptions>(),
             sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<LogTailBroadcastService>>(),
             logFolder
         ));

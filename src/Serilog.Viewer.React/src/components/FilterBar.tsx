@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { Search, X, Filter } from "lucide-react";
 import { useAppStore } from "@/store/appStore";
 import type { LogLevel } from "@/types";
@@ -12,8 +13,34 @@ const LEVELS: LogLevel[] = [
   "Fatal",
 ];
 
+/** Delay between the last keystroke and the search request. Each search is a full scan of the
+ *  selected files' index, so firing it on every keystroke queued several hundred ms of work per
+ *  character typed. */
+const SEARCH_DEBOUNCE_MS = 300;
+
 export function FilterBar() {
   const { filters, setFilter, resetFilters } = useAppStore();
+
+  // Local draft of the search box; committed to the store after the user pauses typing.
+  const [searchDraft, setSearchDraft] = useState(filters.searchText);
+  const lastCommitted = useRef(filters.searchText);
+
+  useEffect(() => {
+    if (searchDraft === lastCommitted.current) return;
+    const handle = setTimeout(() => {
+      lastCommitted.current = searchDraft;
+      setFilter("searchText", searchDraft);
+    }, SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(handle);
+  }, [searchDraft, setFilter]);
+
+  // Reflect external changes (e.g. "Clear filters") without clobbering in-progress typing.
+  useEffect(() => {
+    if (filters.searchText !== lastCommitted.current) {
+      lastCommitted.current = filters.searchText;
+      setSearchDraft(filters.searchText);
+    }
+  }, [filters.searchText]);
 
   const hasFilters =
     filters.searchText ||
@@ -45,8 +72,8 @@ export function FilterBar() {
         <input
           type="text"
           placeholder="Search messages..."
-          value={filters.searchText}
-          onChange={(e) => setFilter("searchText", e.target.value)}
+          value={searchDraft}
+          onChange={(e) => setSearchDraft(e.target.value)}
           className="w-full bg-[#161b22] border border-[#30363d] rounded-lg pl-8 pr-3 py-1.5 text-xs text-[#e6edf3] placeholder:text-[#484f58] focus:outline-none focus:border-[#58a6ff] transition-colors"
         />
       </div>

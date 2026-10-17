@@ -142,14 +142,13 @@ public sealed class FileSystemLogRepository : ILogRepository
         try
         {
             var indexed = await _indexStore.QueryAsync(targetFiles, query, cancellationToken);
-            var items = new List<LogEntry>(indexed.Items.Count);
 
-            foreach (var pointer in indexed.Items)
-            {
-                var entry = await GetEntryAsync(pointer.FileName, pointer.Offset, cancellationToken);
-                if (entry is not null)
-                    items.Add(entry);
-            }
+            // The index row already carries everything the grid renders. Re-reading the log file
+            // costs one open+seek per row (40–75 ms per page of 100), so only do it when the caller
+            // needs the full entry — exports, or the details drawer via GetEntryAsync.
+            var items = query.IncludeFullEntries
+                ? await HydrateAsync(indexed.Items, cancellationToken)
+                : indexed.Items.Select(ToIndexedEntry).ToList();
 
             return new PagedResult<LogEntry>
             {
@@ -199,6 +198,60 @@ public sealed class FileSystemLogRepository : ILogRepository
             Page = query.Page,
             PageSize = query.PageSize,
         };
+    }
+
+    private static LogEntry ToIndexedEntry(IndexedLogPointer pointer) =>
+        new()
+        {
+            Id = $"{pointer.FileName}:{pointer.Offset}",
+            Timestamp = new DateTimeOffset(pointer.TimestampTicks, TimeSpan.Zero),
+            Level = pointer.Level,
+            Message = pointer.Message,
+            Exception = pointer.Exception,
+            SourceContext = pointer.SourceContext,
+            CorrelationId = pointer.CorrelationId,
+            RequestId = pointer.RequestId,
+            LineOffset = pointer.Offset,
+            FileName = pointer.FileName,
+        };
+
+    /// <summary>
+    /// Re-reads the full entries behind <paramref name="pointers"/>, opening each log file once
+    /// and visiting its offsets in ascending order. Entries whose line no longer parses (file
+    /// rewritten under the index) are skipped; the result keeps the pointers' order.
+    /// </summary>
+    private async Task<List<LogEntry>> HydrateAsync(
+        IReadOnlyList<IndexedLogPointer> pointers,
+        CancellationToken cancellationToken
+    )
+    {
+        var byFile = new Dictionary<string, Dictionary<long, LogEntry?>>(StringComparer.Ordinal);
+
+        foreach (var group in pointers.GroupBy(p => p.FileName, StringComparer.Ordinal))
+        {
+            var filePath = ResolveFilePath(group.Key);
+            if (filePath is null)
+                continue;
+
+            byFile[group.Key] = await _reader.ReadEntriesAtOffsetsAsync(
+                filePath,
+                group.Select(p => p.Offset).ToList(),
+                cancellationToken
+            );
+        }
+
+        var items = new List<LogEntry>(pointers.Count);
+        foreach (var pointer in pointers)
+        {
+            if (
+                byFile.TryGetValue(pointer.FileName, out var entries)
+                && entries.TryGetValue(pointer.Offset, out var entry)
+                && entry is not null
+            )
+                items.Add(entry);
+        }
+
+        return items;
     }
 
     public async Task<LogEntry?> GetEntryAsync(

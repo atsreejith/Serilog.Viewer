@@ -10,7 +10,7 @@ namespace Serilog.Viewer.Infrastructure.Indexing;
 
 internal sealed class LogFileIndexStore
 {
-    private const int SchemaVersion = 4;
+    private const int SchemaVersion = 5;
 
     /// <summary>
     /// Maximum number of characters of a message retained in the index. The index only locates
@@ -22,6 +22,7 @@ internal sealed class LogFileIndexStore
     private readonly string _databasePath;
     private readonly StreamingLogFileReader _reader;
     private readonly ILogger _logger;
+    private readonly bool _backgroundIndexing;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _initialized;
 
@@ -31,16 +32,28 @@ internal sealed class LogFileIndexStore
     /// </summary>
     private readonly HashSet<long> _activeBackfills = [];
 
+    /// <summary>
+    /// Dashboard aggregates per file, keyed by file id and valid for one exact index state of
+    /// that file. The dashboard used to re-aggregate every row of every file on each refresh
+    /// (hundreds of ms at a few hundred thousand entries, scaling linearly); with this only files
+    /// whose index actually changed since the last refresh — typically just the active one — are
+    /// recomputed. Guarded by <see cref="_gate"/>.
+    /// </summary>
+    private readonly Dictionary<long, CachedFileStats> _statsCache = [];
+
     public LogFileIndexStore(
         string logFolder,
         StreamingLogFileReader reader,
-        ILogger<LogFileIndexStore>? logger = null
+        ILogger<LogFileIndexStore>? logger = null,
+        string? indexFolder = null,
+        bool backgroundIndexing = true
     )
     {
-        var indexFolder = Path.Combine(logFolder, ".serilog-viewer");
+        indexFolder ??= Path.Combine(logFolder, ".serilog-viewer");
         _databasePath = Path.Combine(indexFolder, "index.sqlite");
         _reader = reader;
         _logger = logger ?? NullLogger<LogFileIndexStore>.Instance;
+        _backgroundIndexing = backgroundIndexing;
     }
 
     public async Task<IndexedQueryResult> QueryAsync(
@@ -60,13 +73,34 @@ internal sealed class LogFileIndexStore
             await using var connection = OpenConnection();
             await EnsureFilesIndexedAsync(connection, files, cancellationToken);
 
+            // A text search is a full LIKE scan of every candidate row, and the count needs the
+            // same scan. Doing both in one statement (COUNT(*) OVER ()) halves the search cost.
+            // Without search text the count is an index-only operation, and the page is a bounded
+            // index walk, so they stay separate: a window function would force the page query to
+            // visit every matching row.
+            var hasSearch = !string.IsNullOrWhiteSpace(query.SearchText);
+
             var countStarted = Stopwatch.GetTimestamp();
-            var total = await CountAsync(connection, files, query, cancellationToken);
+            var total = hasSearch ? 0 : await CountAsync(connection, files, query, cancellationToken);
             var countElapsed = Stopwatch.GetElapsedTime(countStarted);
 
             var pageStarted = Stopwatch.GetTimestamp();
-            var pointers = await GetPageAsync(connection, files, query, cancellationToken);
+            var (pointers, pageTotal) = await GetPageAsync(
+                connection,
+                files,
+                query,
+                includeTotal: hasSearch,
+                cancellationToken
+            );
             var pageElapsed = Stopwatch.GetElapsedTime(pageStarted);
+
+            if (hasSearch)
+            {
+                // An empty page past the end carries no window count; fall back to a plain count.
+                total = pageTotal is { } t
+                    ? (int)Math.Min(t, int.MaxValue)
+                    : await CountAsync(connection, files, query, cancellationToken);
+            }
 
             _logger.LogDebug(
                 "Index query over {FileCount} file(s): count={CountMs} ms ({TotalCount} matches), page={PageMs} ms ({PointerCount} pointers, page {Page} size {PageSize}), search={HasSearchText}",
@@ -104,30 +138,41 @@ internal sealed class LogFileIndexStore
             await using var connection = OpenConnection();
             await EnsureFilesIndexedAsync(connection, files, cancellationToken);
 
-            var levelStarted = Stopwatch.GetTimestamp();
-            var countsByLevel = await GetCountsByLevelAsync(connection, files, cancellationToken);
-            var levelElapsed = Stopwatch.GetElapsedTime(levelStarted);
-
-            var hourStarted = Stopwatch.GetTimestamp();
-            var errorsByHour = await GetErrorsByHourAsync(connection, files, cancellationToken);
-            var hourElapsed = Stopwatch.GetElapsedTime(hourStarted);
-
-            var dayStarted = Stopwatch.GetTimestamp();
-            var logsByDay = await GetLogsByDayAsync(connection, files, cancellationToken);
-            var dayElapsed = Stopwatch.GetElapsedTime(dayStarted);
-
-            var sourcesStarted = Stopwatch.GetTimestamp();
-            var topSources = await GetTopSourcesAsync(connection, files, cancellationToken);
-            var sourcesElapsed = Stopwatch.GetElapsedTime(sourcesStarted);
+            var statsStarted = Stopwatch.GetTimestamp();
+            var (merged, recomputed) = await GetMergedStatsAsync(connection, files, cancellationToken);
+            var statsElapsed = Stopwatch.GetElapsedTime(statsStarted);
 
             _logger.LogDebug(
-                "Index stats over {FileCount} file(s): countsByLevel={CountsByLevelMs} ms, errorsByHour={ErrorsByHourMs} ms, logsByDay={LogsByDayMs} ms, topSources={TopSourcesMs} ms",
+                "Index stats over {FileCount} file(s) in {ElapsedMs} ms: {RecomputedFiles} file(s) re-aggregated, {CachedFiles} served from cache",
                 files.Count,
-                (long)levelElapsed.TotalMilliseconds,
-                (long)hourElapsed.TotalMilliseconds,
-                (long)dayElapsed.TotalMilliseconds,
-                (long)sourcesElapsed.TotalMilliseconds
+                (long)statsElapsed.TotalMilliseconds,
+                recomputed,
+                files.Count - recomputed
             );
+
+            var countsByLevel = merged.ByLevel;
+            var errorsByHour = merged
+                .ErrorsByHour.OrderBy(p => p.Key)
+                .Select(p => new TimeSeriesPoint
+                {
+                    Timestamp = new DateTimeOffset(p.Key, TimeSpan.Zero),
+                    Count = p.Value,
+                })
+                .ToList();
+            var logsByDay = merged
+                .LogsByDay.OrderBy(p => p.Key)
+                .Select(p => new TimeSeriesPoint
+                {
+                    Timestamp = new DateTimeOffset(p.Key, TimeSpan.Zero),
+                    Count = p.Value,
+                })
+                .ToList();
+            var topSources = merged
+                .BySource.OrderByDescending(p => p.Value)
+                .ThenBy(p => p.Key, StringComparer.Ordinal)
+                .Take(10)
+                .Select(p => new SourceDistributionPoint { Source = p.Key, Count = p.Value })
+                .ToList();
 
             var verboses = countsByLevel.GetValueOrDefault(LogLevel.Verbose);
             var debugs = countsByLevel.GetValueOrDefault(LogLevel.Debug);
@@ -211,10 +256,10 @@ internal sealed class LogFileIndexStore
             "CREATE INDEX IF NOT EXISTS ix_entries_file_time ON entries(file_id, timestamp_ticks);"),
         ("ix_entries_level_time",
             "CREATE INDEX IF NOT EXISTS ix_entries_level_time ON entries(level, timestamp_ticks);"),
-        // Leading source_context lets the dashboard's GROUP BY walk the index in order rather than
-        // scanning and sorting the table. file_id trails it to still serve file-filtered queries.
-        ("ix_entries_source_file",
-            "CREATE INDEX IF NOT EXISTS ix_entries_source_file ON entries(source_context, file_id);"),
+        // Dashboard aggregates are computed per file and cached, so file_id leads: the per-file
+        // GROUP BY source_context then walks one contiguous, already-ordered range of the index.
+        ("ix_entries_file_source",
+            "CREATE INDEX IF NOT EXISTS ix_entries_file_source ON entries(file_id, source_context);"),
         // Same reasoning for the day/hour bucketing, which groups on a timestamp expression.
         ("ix_entries_time",
             "CREATE INDEX IF NOT EXISTS ix_entries_time ON entries(timestamp_ticks);"),
@@ -250,9 +295,18 @@ internal sealed class LogFileIndexStore
 
     /// <summary>
     /// Bytes indexed per background backfill slice. The write lock is released between slices, so
-    /// this bounds how long an interactive query can be stuck behind the backfill.
+    /// this bounds how long an interactive query can be stuck behind the backfill. Measured at
+    /// 4 MB, queries during a backfill waited a median 120–240 ms versus ~40 ms idle; 1 MB slices
+    /// cut that wait roughly fourfold for a few percent more per-slice overhead.
     /// </summary>
-    private const long HeadBackfillSliceBytes = 4L * 1024 * 1024;
+    private const long HeadBackfillSliceBytes = 1L * 1024 * 1024;
+
+    /// <summary>
+    /// Pause between backfill slices. The backfill otherwise runs flat out on one core for several
+    /// seconds per 100 MB inside the host application's process; this caps it at roughly two
+    /// thirds of a core and gives waiting queries a clear window to take the gate.
+    /// </summary>
+    private static readonly TimeSpan HeadBackfillSliceDelay = TimeSpan.FromMilliseconds(15);
 
     private static async Task CreateSecondaryIndexesAsync(
         SqliteConnection connection,
@@ -444,7 +498,8 @@ internal sealed class LogFileIndexStore
             // forward from byte 0 makes them the last thing available. The head is backfilled
             // afterwards and the file is queryable in between.
             var bytesToScan = file.SizeBytes - startOffset;
-            var tailFirst = rebuild && bytesToScan >= TailFirstThresholdBytes;
+            var tailFirst =
+                rebuild && _backgroundIndexing && bytesToScan >= TailFirstThresholdBytes;
 
             long ingestFrom = startOffset;
             long headPending = 0;
@@ -700,9 +755,10 @@ internal sealed class LogFileIndexStore
                         _gate.Release();
                     }
 
-                    // Yield between slices so a waiting query wins the gate rather than racing a
-                    // backfill that would otherwise reacquire it immediately.
-                    await Task.Yield();
+                    // Pause between slices so a waiting query wins the gate rather than racing a
+                    // backfill that would otherwise reacquire it immediately, and so the backfill
+                    // never monopolises a core of the host process.
+                    await Task.Delay(HeadBackfillSliceDelay);
                 }
 
                 _logger.LogDebug(
@@ -901,10 +957,18 @@ internal sealed class LogFileIndexStore
         return count > int.MaxValue ? int.MaxValue : (int)count;
     }
 
-    private async Task<IReadOnlyList<IndexedLogPointer>> GetPageAsync(
+    /// <summary>
+    /// Returns one page of matching entries. Every column the grid renders is read from the index
+    /// row itself, so callers can show a page without touching the log files; the offset is kept
+    /// so the full entry can still be re-read on demand. With <paramref name="includeTotal"/> the
+    /// statement also returns the total match count via a window function, which costs a full
+    /// scan of the matches and is therefore only used when the WHERE clause already forces one.
+    /// </summary>
+    private async Task<(IReadOnlyList<IndexedLogPointer> Pointers, long? Total)> GetPageAsync(
         SqliteConnection connection,
         IReadOnlyList<LogFile> files,
         LogQuery query,
+        bool includeTotal,
         CancellationToken cancellationToken
     )
     {
@@ -912,7 +976,16 @@ internal sealed class LogFileIndexStore
         await using var command = connection.CreateCommand();
         command.CommandText =
             $"""
-            SELECT f.name, e.offset
+            SELECT
+                f.name,
+                e.offset,
+                e.timestamp_ticks,
+                e.level,
+                e.message,
+                e.exception,
+                e.source_context,
+                e.correlation_id,
+                e.request_id{(includeTotal ? ", COUNT(*) OVER () AS total" : string.Empty)}
             FROM entries e
             JOIN files f ON f.id = e.file_id
             {BuildWhere(command, files, query)}
@@ -923,134 +996,203 @@ internal sealed class LogFileIndexStore
         command.Parameters.AddWithValue("$offset", offset);
 
         var results = new List<IndexedLogPointer>(query.PageSize);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-            results.Add(new IndexedLogPointer(reader.GetString(0), reader.GetInt64(1)));
-
-        return results;
-    }
-
-    private async Task<Dictionary<LogLevel, long>> GetCountsByLevelAsync(
-        SqliteConnection connection,
-        IReadOnlyList<LogFile> files,
-        CancellationToken cancellationToken
-    )
-    {
-        await using var command = connection.CreateCommand();
-        command.CommandText =
-            $"SELECT e.level, COUNT(*) FROM entries e {BuildFileWhere(command, files)} GROUP BY e.level;";
-
-        var result = new Dictionary<LogLevel, long>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-            result[(LogLevel)reader.GetInt32(0)] = reader.GetInt64(1);
-
-        return result;
-    }
-
-    private async Task<IReadOnlyList<TimeSeriesPoint>> GetErrorsByHourAsync(
-        SqliteConnection connection,
-        IReadOnlyList<LogFile> files,
-        CancellationToken cancellationToken
-    )
-    {
-        await using var command = connection.CreateCommand();
-        command.CommandText =
-            $"""
-            SELECT
-                ((e.timestamp_ticks / 36000000000) * 36000000000) AS hour_ticks,
-                COUNT(*)
-            FROM entries e
-            {BuildFileWhere(command, files)}
-                AND e.level >= $error_level
-            GROUP BY hour_ticks
-            ORDER BY hour_ticks ASC;
-            """;
-        command.Parameters.AddWithValue("$error_level", (int)LogLevel.Error);
-
-        var result = new List<TimeSeriesPoint>();
+        long? total = null;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
         {
-            result.Add(
-                new TimeSeriesPoint
-                {
-                    Timestamp = new DateTimeOffset(reader.GetInt64(0), TimeSpan.Zero),
-                    Count = reader.GetInt64(1),
-                }
+            results.Add(
+                new IndexedLogPointer(
+                    reader.GetString(0),
+                    reader.GetInt64(1),
+                    reader.GetInt64(2),
+                    (LogLevel)reader.GetInt32(3),
+                    reader.GetString(4),
+                    reader.IsDBNull(5) ? null : reader.GetString(5),
+                    reader.IsDBNull(6) ? null : reader.GetString(6),
+                    reader.IsDBNull(7) ? null : reader.GetString(7),
+                    reader.IsDBNull(8) ? null : reader.GetString(8)
+                )
             );
+            if (includeTotal && total is null)
+                total = reader.GetInt64(9);
         }
 
-        return result;
+        return (results, total);
     }
 
-    private async Task<IReadOnlyList<TimeSeriesPoint>> GetLogsByDayAsync(
+    /// <summary>
+    /// The exact index state of one file that a cached aggregate is valid for. Ingest updates
+    /// size/last-write/last-scanned in the same transaction as the rows, and the backfill advances
+    /// head_scanned_offset the same way, so any change to the rows changes this key.
+    /// </summary>
+    private sealed record FileStatsKey(
+        long SizeBytes,
+        long LastWriteTicks,
+        long LastScannedOffset,
+        long HeadScannedOffset
+    );
+
+    private sealed class FileStatsSnapshot
+    {
+        public Dictionary<LogLevel, long> ByLevel { get; } = [];
+        public Dictionary<long, long> ErrorsByHour { get; } = [];
+        public Dictionary<long, long> LogsByDay { get; } = [];
+        public Dictionary<string, long> BySource { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed record CachedFileStats(FileStatsKey Key, FileStatsSnapshot Snapshot);
+
+    /// <summary>
+    /// Merges the per-file aggregates of <paramref name="files"/>, recomputing only those whose
+    /// index state changed since they were last cached. Also evicts cache entries for files that
+    /// have left the index. Must be called while holding <see cref="_gate"/>.
+    /// </summary>
+    private async Task<(FileStatsSnapshot Merged, int Recomputed)> GetMergedStatsAsync(
         SqliteConnection connection,
         IReadOnlyList<LogFile> files,
         CancellationToken cancellationToken
     )
     {
-        await using var command = connection.CreateCommand();
-        command.CommandText =
-            $"""
-            SELECT
-                ((e.timestamp_ticks / 864000000000) * 864000000000) AS day_ticks,
-                COUNT(*)
-            FROM entries e
-            {BuildFileWhere(command, files)}
-            GROUP BY day_ticks
-            ORDER BY day_ticks ASC;
-            """;
+        var wanted = new HashSet<string>(files.Select(f => f.Name), StringComparer.Ordinal);
+        var merged = new FileStatsSnapshot();
+        var recomputed = 0;
+        var indexedIds = new HashSet<long>();
 
-        var result = new List<TimeSeriesPoint>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var rows = new List<(long Id, string Name, FileStatsKey Key)>();
+        await using (var command = connection.CreateCommand())
         {
-            result.Add(
-                new TimeSeriesPoint
-                {
-                    Timestamp = new DateTimeOffset(reader.GetInt64(0), TimeSpan.Zero),
-                    Count = reader.GetInt64(1),
-                }
-            );
+            command.CommandText =
+                "SELECT id, name, size_bytes, last_write_ticks, last_scanned_offset, head_scanned_offset FROM files;";
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                rows.Add(
+                    (
+                        reader.GetInt64(0),
+                        reader.GetString(1),
+                        new FileStatsKey(
+                            reader.GetInt64(2),
+                            reader.GetInt64(3),
+                            reader.GetInt64(4),
+                            reader.GetInt64(5)
+                        )
+                    )
+                );
+            }
         }
 
-        return result;
+        foreach (var (id, name, key) in rows)
+        {
+            indexedIds.Add(id);
+            if (!wanted.Contains(name))
+                continue;
+
+            if (!_statsCache.TryGetValue(id, out var cached) || cached.Key != key)
+            {
+                cached = new CachedFileStats(
+                    key,
+                    await ComputeFileStatsAsync(connection, id, cancellationToken)
+                );
+                _statsCache[id] = cached;
+                recomputed++;
+            }
+
+            Merge(merged, cached.Snapshot);
+        }
+
+        foreach (var stale in _statsCache.Keys.Where(id => !indexedIds.Contains(id)).ToList())
+            _statsCache.Remove(stale);
+
+        return (merged, recomputed);
     }
 
-    private async Task<IReadOnlyList<SourceDistributionPoint>> GetTopSourcesAsync(
+    private static void Merge(FileStatsSnapshot into, FileStatsSnapshot from)
+    {
+        foreach (var (level, count) in from.ByLevel)
+            into.ByLevel[level] = into.ByLevel.GetValueOrDefault(level) + count;
+        foreach (var (hour, count) in from.ErrorsByHour)
+            into.ErrorsByHour[hour] = into.ErrorsByHour.GetValueOrDefault(hour) + count;
+        foreach (var (day, count) in from.LogsByDay)
+            into.LogsByDay[day] = into.LogsByDay.GetValueOrDefault(day) + count;
+        foreach (var (source, count) in from.BySource)
+            into.BySource[source] = into.BySource.GetValueOrDefault(source) + count;
+    }
+
+    /// <summary>
+    /// Aggregates one file. Every statement filters on <c>file_id</c>, so each walks one
+    /// contiguous range of a file-leading index instead of the whole table.
+    /// </summary>
+    private static async Task<FileStatsSnapshot> ComputeFileStatsAsync(
         SqliteConnection connection,
-        IReadOnlyList<LogFile> files,
+        long fileId,
         CancellationToken cancellationToken
     )
     {
-        await using var command = connection.CreateCommand();
-        command.CommandText =
-            $"""
-            SELECT e.source_context, COUNT(*) AS count
-            FROM entries e
-            {BuildFileWhere(command, files)}
-                AND e.source_context IS NOT NULL
-                AND e.source_context <> ''
-            GROUP BY e.source_context
-            ORDER BY count DESC, e.source_context ASC
-            LIMIT 10;
-            """;
+        var snapshot = new FileStatsSnapshot();
 
-        var result = new List<SourceDistributionPoint>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        await using (var command = connection.CreateCommand())
         {
-            result.Add(
-                new SourceDistributionPoint
-                {
-                    Source = reader.GetString(0),
-                    Count = reader.GetInt64(1),
-                }
-            );
+            command.CommandText =
+                "SELECT e.level, COUNT(*) FROM entries e WHERE e.file_id = $id GROUP BY e.level;";
+            command.Parameters.AddWithValue("$id", fileId);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                snapshot.ByLevel[(LogLevel)reader.GetInt32(0)] = reader.GetInt64(1);
         }
 
-        return result;
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText =
+                """
+                SELECT
+                    ((e.timestamp_ticks / 36000000000) * 36000000000) AS hour_ticks,
+                    COUNT(*)
+                FROM entries e
+                WHERE e.file_id = $id AND e.level >= $error_level
+                GROUP BY hour_ticks;
+                """;
+            command.Parameters.AddWithValue("$id", fileId);
+            command.Parameters.AddWithValue("$error_level", (int)LogLevel.Error);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                snapshot.ErrorsByHour[reader.GetInt64(0)] = reader.GetInt64(1);
+        }
+
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText =
+                """
+                SELECT
+                    ((e.timestamp_ticks / 864000000000) * 864000000000) AS day_ticks,
+                    COUNT(*)
+                FROM entries e
+                WHERE e.file_id = $id
+                GROUP BY day_ticks;
+                """;
+            command.Parameters.AddWithValue("$id", fileId);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                snapshot.LogsByDay[reader.GetInt64(0)] = reader.GetInt64(1);
+        }
+
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText =
+                """
+                SELECT e.source_context, COUNT(*)
+                FROM entries e
+                WHERE e.file_id = $id
+                    AND e.source_context IS NOT NULL
+                    AND e.source_context <> ''
+                GROUP BY e.source_context;
+                """;
+            command.Parameters.AddWithValue("$id", fileId);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                snapshot.BySource[reader.GetString(0)] = reader.GetInt64(1);
+        }
+
+        return snapshot;
     }
 
     private static string BuildWhere(
@@ -1115,26 +1257,59 @@ internal sealed class LogFileIndexStore
         return "WHERE " + string.Join(" AND ", predicates);
     }
 
-    private static string BuildFileWhere(SqliteCommand command, IReadOnlyList<LogFile> files) =>
-        "WHERE " + BuildFilePredicate(command, files);
-
     private static string BuildFilePredicate(SqliteCommand command, IReadOnlyList<LogFile> files)
     {
-        // When every indexed file is selected — the dashboard's default — the subquery only asks
-        // whether each row belongs to a file it already belongs to. Skipping it lets SQLite use the
-        // file-leading indexes directly instead of materializing the id set per aggregation.
-        if (SelectsAllIndexedFiles(command, files))
+        var indexed = LoadIndexedFileIds(command);
+
+        // When every indexed file is selected — the all-files view — the predicate would only ask
+        // whether each row belongs to a file it already belongs to. Dropping it lets SQLite walk
+        // ix_entries_time straight into the page instead of filtering or sorting anything.
+        if (SelectsAllIndexedFiles(indexed, files))
             return "1=1";
 
-        var fileParameters = new List<string>(files.Count);
-        for (var i = 0; i < files.Count; i++)
+        var ids = new List<long>(files.Count);
+        foreach (var file in files)
         {
-            var name = "$file" + i;
-            fileParameters.Add(name);
-            command.Parameters.AddWithValue(name, files[i].Name);
+            if (indexed.TryGetValue(file.Name, out var id))
+                ids.Add(id);
         }
 
-        return $"e.file_id IN (SELECT id FROM files WHERE name IN ({string.Join(",", fileParameters)}))";
+        if (ids.Count == 0)
+            return "0=1";
+
+        // Bind the ids themselves. A single file becomes an equality, which lets SQLite serve a
+        // timestamp-ordered page straight from ix_entries_file_time (0 ms) — the previous
+        // IN (SELECT id FROM files WHERE name IN (...)) form made it pick a different index and
+        // sort every row of the file first.
+        if (ids.Count == 1)
+        {
+            command.Parameters.AddWithValue("$file_id", ids[0]);
+            return "e.file_id = $file_id";
+        }
+
+        var parameters = new List<string>(ids.Count);
+        for (var i = 0; i < ids.Count; i++)
+        {
+            var name = "$file_id" + i;
+            parameters.Add(name);
+            command.Parameters.AddWithValue(name, ids[i]);
+        }
+
+        return $"e.file_id IN ({string.Join(",", parameters)})";
+    }
+
+    private static Dictionary<string, long> LoadIndexedFileIds(SqliteCommand command)
+    {
+        using var indexed = command.Connection!.CreateCommand();
+        indexed.Transaction = command.Transaction;
+        indexed.CommandText = "SELECT name, id FROM files;";
+
+        var result = new Dictionary<string, long>(StringComparer.Ordinal);
+        using var reader = indexed.ExecuteReader();
+        while (reader.Read())
+            result[reader.GetString(0)] = reader.GetInt64(1);
+
+        return result;
     }
 
     /// <summary>
@@ -1142,25 +1317,17 @@ internal sealed class LogFileIndexStore
     /// actual name sets, not just counts: a stale row (e.g. a log file deleted from disk) would
     /// otherwise let a partial selection match on count alone and silently widen the query.
     /// </summary>
-    private static bool SelectsAllIndexedFiles(SqliteCommand command, IReadOnlyList<LogFile> files)
+    private static bool SelectsAllIndexedFiles(
+        Dictionary<string, long> indexed,
+        IReadOnlyList<LogFile> files
+    )
     {
-        using var indexed = command.Connection!.CreateCommand();
-        indexed.Transaction = command.Transaction;
-        indexed.CommandText = "SELECT name FROM files;";
-
-        var indexedNames = new HashSet<string>(StringComparer.Ordinal);
-        using (var reader = indexed.ExecuteReader())
-        {
-            while (reader.Read())
-                indexedNames.Add(reader.GetString(0));
-        }
-
-        if (indexedNames.Count != files.Count)
+        if (indexed.Count != files.Count)
             return false;
 
         foreach (var file in files)
         {
-            if (!indexedNames.Contains(file.Name))
+            if (!indexed.ContainsKey(file.Name))
                 return false;
         }
 
@@ -1177,7 +1344,11 @@ internal sealed class LogFileIndexStore
             _ => $"e.timestamp_ticks {direction}",
         };
 
-        return $"ORDER BY {primary}, f.name ASC, e.offset ASC";
+        // The tie-breaker must be the rowid, not a column from the joined files table. SQLite can
+        // only stream a page straight out of an index when the ORDER BY is that index's key plus
+        // rowid; any other trailing column (f.name used to be here) forces it to materialise and
+        // sort every matching row — 40–780 ms for an all-files page versus under 1 ms.
+        return $"ORDER BY {primary}, e.id {direction}";
     }
 
     private static string EscapeLike(string value) =>
@@ -1203,12 +1374,13 @@ internal sealed class LogFileIndexStore
                 f.size_bytes,
                 f.last_write_ticks,
                 f.last_scanned_offset,
-                COALESCE(MAX(e.seq) + 1, 0),
+                -- Correlated scalar subquery rather than LEFT JOIN + GROUP BY: SQLite answers
+                -- MAX over the (file_id, seq) index in O(log n) this way, but walked every row
+                -- of the file in the join form (8-13 ms per file, on every request).
+                (SELECT COALESCE(MAX(e.seq) + 1, 0) FROM entries e WHERE e.file_id = f.id),
                 f.head_scanned_offset
             FROM files f
-            LEFT JOIN entries e ON e.file_id = f.id
-            WHERE f.name = $name
-            GROUP BY f.id;
+            WHERE f.name = $name;
             """;
         command.Parameters.AddWithValue("$name", file.Name);
 
@@ -1242,12 +1414,10 @@ internal sealed class LogFileIndexStore
                 f.size_bytes,
                 f.last_write_ticks,
                 f.last_scanned_offset,
-                COALESCE(MAX(e.seq) + 1, 0),
+                (SELECT COALESCE(MAX(e.seq) + 1, 0) FROM entries e WHERE e.file_id = f.id),
                 f.head_scanned_offset
             FROM files f
-            LEFT JOIN entries e ON e.file_id = f.id
-            WHERE f.id = $id
-            GROUP BY f.id;
+            WHERE f.id = $id;
             """;
         command.Parameters.AddWithValue("$id", fileId);
 
@@ -1411,9 +1581,11 @@ internal sealed class LogFileIndexStore
         // synchronous and cache_size are per-connection, so setting them once during schema setup
         // had no effect on the connections that actually do the work — those ran at the default
         // FULL. journal_mode=WAL is persisted in the database file itself and is not repeated here.
+        // The page cache lives in the host application's process and pooled connections keep it
+        // alive, so it is kept modest (16 MB); the hot paths are index walks that need little of it.
         using (var pragma = connection.CreateCommand())
         {
-            pragma.CommandText = "PRAGMA synchronous=NORMAL; PRAGMA cache_size=-65536; PRAGMA temp_store=MEMORY;";
+            pragma.CommandText = "PRAGMA synchronous=NORMAL; PRAGMA cache_size=-16384; PRAGMA temp_store=MEMORY;";
             pragma.ExecuteNonQuery();
         }
 
@@ -1438,4 +1610,20 @@ internal sealed class LogFileIndexStore
 
 internal sealed record IndexedQueryResult(IReadOnlyList<IndexedLogPointer> Items, int TotalCount);
 
-internal sealed record IndexedLogPointer(string FileName, long Offset);
+/// <summary>
+/// One index row: where the entry lives (<paramref name="FileName"/> is the folder-relative name,
+/// <paramref name="Offset"/> the byte offset of its line) plus the indexed columns, enough to render
+/// a grid row without re-reading the file. <paramref name="Message"/> is truncated to the indexed
+/// prefix.
+/// </summary>
+internal sealed record IndexedLogPointer(
+    string FileName,
+    long Offset,
+    long TimestampTicks,
+    LogLevel Level,
+    string Message,
+    string? Exception,
+    string? SourceContext,
+    string? CorrelationId,
+    string? RequestId
+);

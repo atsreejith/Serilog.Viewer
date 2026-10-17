@@ -34,4 +34,20 @@ public sealed class LogViewerOptions
     /// Disabled by default because this is a destructive operation.
     /// </summary>
     public bool EnableFileDelete { get; set; } = false;
+
+    /// <summary>
+    /// Folder where the SQLite search index is stored. Defaults to a <c>.serilog-viewer</c>
+    /// folder inside <see cref="LogFolder"/>. Point it elsewhere (e.g. local app data) if
+    /// backup or log-shipping agents watch the log folder — the index is roughly 20% of the
+    /// size of the logs it covers.
+    /// </summary>
+    public string? IndexFolder { get; set; }
+
+    /// <summary>
+    /// When true (default), large files are made queryable from their newest entries first and
+    /// the rest is indexed in the background, using about one CPU core for a few seconds per
+    /// 100 MB. Set to false on hosts where background CPU must be avoided; the first query over a
+    /// large file then indexes it fully before returning.
+    /// </summary>
+    public bool BackgroundIndexing { get; set; } = true;
 }
