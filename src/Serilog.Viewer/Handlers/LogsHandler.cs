@@ -14,7 +14,8 @@ internal static class LogsHandler
         CancellationToken cancellationToken
     )
     {
-        var query = BuildQuery(request);
+        // Grid rows come straight from the index; the details drawer fetches the full entry.
+        var query = BuildQuery(request, includeFullEntries: false);
         var beforeMemory = GC.GetTotalMemory(forceFullCollection: false);
         var start = Stopwatch.GetTimestamp();
         var result = await repository.QueryAsync(query, cancellationToken);
@@ -85,7 +86,7 @@ internal static class LogsHandler
         return Results.Empty;
     }
 
-    private static LogQuery BuildQuery(HttpRequest request)
+    private static LogQuery BuildQuery(HttpRequest request, bool includeFullEntries = true)
     {
         var q = request.Query;
 
@@ -127,6 +128,7 @@ internal static class LogsHandler
                 "asc",
                 StringComparison.OrdinalIgnoreCase
             ),
+            IncludeFullEntries = includeFullEntries,
         };
     }
 

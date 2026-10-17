@@ -10,11 +10,11 @@ export const router = createBrowserRouter(
       path: "/",
       element: <MainLayout />,
       children: [
-        { index: true, element: <Navigate to="/dashboard" replace /> },
+        { index: true, element: <Navigate to="/explorer" replace /> },
         { path: "dashboard", element: <Dashboard /> },
         { path: "explorer", element: <LogExplorer /> },
         { path: "live", element: <LiveTail /> },
-        { path: "*", element: <Navigate to="/dashboard" replace /> },
+        { path: "*", element: <Navigate to="/explorer" replace /> },
       ],
     },
   ],

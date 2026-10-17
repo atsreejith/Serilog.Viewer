@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 using Serilog.Viewer.Interfaces;
+using Serilog.Viewer.Realtime.Services;
 
 namespace Serilog.Viewer.Realtime.Hubs;
 
@@ -11,17 +12,24 @@ namespace Serilog.Viewer.Realtime.Hubs;
 public sealed class LogTailHub : Hub
 {
     private readonly ILogFileWatcher _watcher;
+    private readonly LiveTailSubscriptions _subscriptions;
     private readonly ILogger<LogTailHub> _logger;
 
-    public LogTailHub(ILogFileWatcher watcher, ILogger<LogTailHub> logger)
+    public LogTailHub(
+        ILogFileWatcher watcher,
+        LiveTailSubscriptions subscriptions,
+        ILogger<LogTailHub> logger
+    )
     {
         _watcher = watcher;
+        _subscriptions = subscriptions;
         _logger = logger;
     }
 
     public async Task SubscribeToFile(string fileName)
     {
         await Groups.AddToGroupAsync(Context.ConnectionId, $"file:{fileName}");
+        _subscriptions.Subscribed(Context.ConnectionId);
         _logger.LogDebug(
             "Client {ConnectionId} subscribed to file {FileName}",
             Context.ConnectionId,
@@ -32,16 +40,19 @@ public sealed class LogTailHub : Hub
     public async Task UnsubscribeFromFile(string fileName)
     {
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"file:{fileName}");
+        _subscriptions.Unsubscribed(Context.ConnectionId);
     }
 
     public async Task SubscribeToAll()
     {
         await Groups.AddToGroupAsync(Context.ConnectionId, "all-files");
+        _subscriptions.Subscribed(Context.ConnectionId);
     }
 
     public async Task UnsubscribeFromAll()
     {
         await Groups.RemoveFromGroupAsync(Context.ConnectionId, "all-files");
+        _subscriptions.Unsubscribed(Context.ConnectionId);
     }
 
     public override async Task OnConnectedAsync()
@@ -53,6 +64,7 @@ public sealed class LogTailHub : Hub
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
         _logger.LogDebug("Log tail client disconnected: {ConnectionId}", Context.ConnectionId);
+        _subscriptions.Disconnected(Context.ConnectionId);
         await base.OnDisconnectedAsync(exception);
     }
 }

@@ -95,6 +95,8 @@ All options are set via the `LogViewerOptions` lambda passed to `AddLogViewer`:
 | `AuthRealm` | `string` | `"Log Viewer"` | Realm shown in the browser's auth challenge dialog |
 | `EnableFileDownload` | `bool` | `true` | Allow downloading log files from the viewer UI and API |
 | `EnableFileDelete` | `bool` | `false` | Allow deleting log files from the viewer UI and API |
+| `IndexFolder` | `string?` | `null` | Where the SQLite search index lives. Defaults to `<LogFolder>/.serilog-viewer`. Set it when backup or log-shipping agents watch the log folder (the index is roughly 20% of the size of the logs) |
+| `BackgroundIndexing` | `bool` | `true` | Large files become queryable from their newest entries within a second and the rest is indexed in the background. Set to `false` to forbid background work in the host process; the first query over a large file then indexes it fully before returning |
 
 ### Example — custom path and Basic Auth
 
@@ -127,7 +129,20 @@ builder.Services.
     .AddLogViewerRealtime();
 ```
 
-A **Live Tail** tab will appear in the UI. No SignalR client code is required — the bundled React app handles it automatically. Applications that do not call `AddLogViewerRealtime` incur zero SignalR overhead.
+A **Live Tail** tab will appear in the UI. No SignalR client code is required — the bundled React app handles it automatically. Applications that do not call `AddLogViewerRealtime` incur zero SignalR overhead. The log folder is only watched while at least one browser has Live Tail running; an idle viewer does not read or broadcast anything.
+
+---
+
+## Performance and host impact
+
+The viewer is designed to stay out of the way of the application that hosts it:
+
+- **Nothing runs at startup.** Services are registered lazily; the first request to the viewer opens the index.
+- **Grid pages come from the index**, not from the log files. A page of 100 rows is a single bounded index walk plus one SQLite round-trip; the full entry (structured properties, raw line) is read from the file only when a row is opened in the details drawer or exported.
+- **Large files are indexed newest-first.** A cold open of a multi-hundred-megabyte file shows its newest entries in well under a second. The rest is backfilled in 1 MB slices with a pause between them, so the backfill uses well under one core and interactive queries are never blocked for more than a few tens of milliseconds. Set `BackgroundIndexing = false` to disable this.
+- **Dashboard aggregates are cached per file** and recomputed only for files whose index changed, so a refresh costs a few milliseconds for every file except the one currently being written.
+- **Memory.** The SQLite page cache is capped at 16 MB per connection. Expect a working set in the tens of megabytes on top of the host process.
+- **Disk.** The index is roughly 20% of the size of the logs it covers and lives in `IndexFolder`. It is safe to delete at any time; it is rebuilt on the next request.
 
 ---
 

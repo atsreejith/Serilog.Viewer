@@ -35,9 +35,11 @@ public static class LogViewerExtensions
             o.AuthRealm = options.AuthRealm;
             o.EnableFileDownload = options.EnableFileDownload;
             o.EnableFileDelete = options.EnableFileDelete;
+            o.IndexFolder = options.IndexFolder;
+            o.BackgroundIndexing = options.BackgroundIndexing;
         });
 
-        services.AddLogViewerInfrastructure(options.LogFolder);
+        services.AddLogViewerInfrastructure(options);
 
         var builder = new LogViewerBuilder(services, options);
         services.AddSingleton<ILogViewerBuilder>(builder);

@@ -12,9 +12,10 @@ internal static class InfrastructureServiceExtensions
 {
     public static IServiceCollection AddLogViewerInfrastructure(
         this IServiceCollection services,
-        string logFolder
+        LogViewerOptions options
     )
     {
+        var logFolder = options.LogFolder;
         services.AddSingleton<ILogParser, ClefLogParser>();
         services.AddSingleton<ILogParser, PlainTextLogParser>();
         services.AddSingleton<LogParserFactory>();
@@ -22,7 +23,9 @@ internal static class InfrastructureServiceExtensions
         services.AddSingleton(sp => new LogFileIndexStore(
             logFolder,
             sp.GetRequiredService<StreamingLogFileReader>(),
-            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<LogFileIndexStore>>()
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<LogFileIndexStore>>(),
+            options.IndexFolder,
+            options.BackgroundIndexing
         ));
         services.AddSingleton<ILogRepository>(sp =>
         {
