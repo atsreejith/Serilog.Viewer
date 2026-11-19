@@ -95,8 +95,8 @@ All options are set via the `LogViewerOptions` lambda passed to `AddLogViewer`:
 | `AuthRealm` | `string` | `"Log Viewer"` | Realm shown in the browser's auth challenge dialog |
 | `EnableFileDownload` | `bool` | `true` | Allow downloading log files from the viewer UI and API |
 | `EnableFileDelete` | `bool` | `false` | Allow deleting log files from the viewer UI and API |
-| `IndexFolder` | `string?` | `null` | Where the SQLite search index lives. Defaults to `<LogFolder>/.serilog-viewer`. Set it when backup or log-shipping agents watch the log folder (the index is roughly 20% of the size of the logs) |
-| `BackgroundIndexing` | `bool` | `true` | Large files become queryable from their newest entries within a second and the rest is indexed in the background. Set to `false` to forbid background work in the host process; the first query over a large file then indexes it fully before returning |
+| `IndexFolder` | `string?` | `null` | Where the SQLite search index lives. Defaults to `<LogFolder>/.serilog-viewer`. Set it when backup or log-shipping agents watch the log folder (see [Disk](#performance-and-host-impact) for its size) |
+| `BackgroundIndexing` | `bool` | `true` | The first request indexes only the newest part of the logs before answering and the rest is indexed in the background. Set to `false` to forbid background work in the host process; the first query then indexes every file it covers fully before returning |
 
 ### Example — custom path and Basic Auth
 
@@ -139,10 +139,12 @@ The viewer is designed to stay out of the way of the application that hosts it:
 
 - **Nothing runs at startup.** Services are registered lazily; the first request to the viewer opens the index.
 - **Grid pages come from the index**, not from the log files. A page of 100 rows is a single bounded index walk plus one SQLite round-trip; the full entry (structured properties, raw line) is read from the file only when a row is opened in the details drawer or exported.
-- **Large files are indexed newest-first.** A cold open of a multi-hundred-megabyte file shows its newest entries in well under a second. The rest is backfilled in 1 MB slices with a pause between them, so the backfill uses well under one core and interactive queries are never blocked for more than a few tens of milliseconds. Set `BackgroundIndexing = false` to disable this.
+- **Logs are indexed newest-first.** A request indexes at most 32 MB of not-yet-indexed log before it answers, taking files newest first: a file that fits is indexed whole, a larger one from a window at its end. A cold open of a multi-hundred-megabyte file, or of a folder of many files, therefore shows its newest entries in about a second. The rest is backfilled in 1 MB slices with pauses, so the backfill uses well under one core. Set `BackgroundIndexing = false` to disable this.
+- **Queries do not wait for indexing.** The index runs in WAL mode and queries read a snapshot, so a page request over files that are already indexed returns in a few milliseconds while a backfill is running. Only a request that has new lines to index waits, for at most one backfill burst (about 100 ms).
 - **Dashboard aggregates are cached per file** and recomputed only for files whose index changed, so a refresh costs a few milliseconds for every file except the one currently being written.
 - **Memory.** The SQLite page cache is capped at 16 MB per connection. Expect a working set in the tens of megabytes on top of the host process.
-- **Disk.** The index is roughly 20% of the size of the logs it covers and lives in `IndexFolder`. It is safe to delete at any time; it is rebuilt on the next request.
+- **Exports are streamed.** A CSV or JSON export is written to the response as the entries are read from the log files, so it holds a batch of entries in memory rather than the whole export.
+- **Disk.** The index lives in `IndexFolder` and keeps the first 512 characters of each message and the first 8 KB of each exception, so its size depends on the shape of the logs: about a fifth of the log size for large structured events, and more than the log size for short plain-text lines with stack traces. It is safe to delete at any time; it is rebuilt on the next request.
 
 ---
 
@@ -154,6 +156,8 @@ The viewer is designed to stay out of the way of the application that hosts it:
 | `.json` | Compact Log Event Format (CLEF / JSON) | `ClefLogParser` |
 | `.log` | Plain-text Serilog output template | `PlainTextLogParser` |
 | `.txt` | Plain-text Serilog output template | `PlainTextLogParser` |
+
+In plain-text logs an entry starts on a line of the form `timestamp [LEVEL] message`, with the level in any width Serilog renders (`INF`, `INFO`, `Information`). Lines that follow without starting a new entry — an exception and its stack trace — belong to that entry: they are shown as its exception and are searchable.
 
 ---
 

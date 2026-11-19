@@ -158,10 +158,71 @@ public sealed class FileSystemLogRepository : ILogRepository
                 PageSize = query.PageSize,
             };
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "Falling back to streaming log query because indexing failed");
             return await QueryByStreamingAsync(targetFiles, query, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// How many entries an export re-reads from the log files at a time. Each batch is read,
+    /// handed to the caller and released before the next, so an export holds one batch of full
+    /// entries in memory rather than all of them.
+    /// </summary>
+    private const int FullEntryBatchSize = 1000;
+
+    /// <summary>
+    /// Streams the full entries of the page <paramref name="query"/> describes, in query order.
+    /// Unlike <see cref="QueryAsync"/> the page is never materialised as a whole, which is what
+    /// makes a 50,000-entry export affordable.
+    /// </summary>
+    internal async IAsyncEnumerable<LogEntry> QueryFullEntriesAsync(
+        LogQuery query,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+            CancellationToken cancellationToken = default
+    )
+    {
+        var targetFiles = await GetTargetFilesAsync(query, cancellationToken);
+        if (targetFiles.Count == 0)
+            yield break;
+
+        IReadOnlyList<IndexedLogPointer>? pointers = null;
+        IReadOnlyList<LogEntry>? fallback = null;
+        try
+        {
+            // Only the location of each entry is needed here: the entry itself comes from the file.
+            var indexed = await _indexStore.QueryAsync(
+                targetFiles,
+                query,
+                cancellationToken,
+                locateOnly: true
+            );
+            pointers = indexed.Items;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Falling back to streaming log query because indexing failed");
+            fallback = (await QueryByStreamingAsync(targetFiles, query, cancellationToken)).Items;
+        }
+
+        if (pointers is null)
+        {
+            foreach (var entry in fallback!)
+                yield return entry;
+            yield break;
+        }
+
+        var batch = new List<IndexedLogPointer>(Math.Min(pointers.Count, FullEntryBatchSize));
+        for (var i = 0; i < pointers.Count; i += FullEntryBatchSize)
+        {
+            batch.Clear();
+            var end = Math.Min(pointers.Count, i + FullEntryBatchSize);
+            for (var j = i; j < end; j++)
+                batch.Add(pointers[j]);
+
+            foreach (var entry in await HydrateAsync(batch, cancellationToken))
+                yield return entry;
         }
     }
 
@@ -264,12 +325,9 @@ public sealed class FileSystemLogRepository : ILogRepository
         if (filePath is null)
             return null;
 
-        await foreach (
-            var entry in _reader.ReadFromOffsetAsync(filePath, lineOffset, cancellationToken)
-        )
-            return entry;
-
-        return null;
+        // Only the entry that starts exactly at the offset. Reading forward to the next line that
+        // happens to parse would hand back a different entry than the one asked for.
+        return await _reader.ReadEntryAtAsync(filePath, lineOffset, cancellationToken);
     }
 
     public async Task<DashboardStats> GetStatsAsync(

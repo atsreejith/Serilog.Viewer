@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text;
 using Serilog.Viewer.Infrastructure.Parsing;
 using Serilog.Viewer.Interfaces;
@@ -10,6 +11,12 @@ namespace Serilog.Viewer.Infrastructure.Reading;
 /// </summary>
 public sealed class StreamingLogFileReader
 {
+    /// <summary>
+    /// Upper bound on the continuation text (exception and stack trace) attached to one entry, so
+    /// a file that stops looking like a log part-way through cannot grow one entry without limit.
+    /// </summary>
+    private const int MaxContinuationChars = 1024 * 1024;
+
     private readonly LogParserFactory _parserFactory;
 
     public StreamingLogFileReader(LogParserFactory parserFactory)
@@ -17,55 +24,107 @@ public sealed class StreamingLogFileReader
         _parserFactory = parserFactory;
     }
 
-    public async IAsyncEnumerable<LogEntry> ReadAsync(
+    public IAsyncEnumerable<LogEntry> ReadAsync(
         string filePath,
-        [System.Runtime.CompilerServices.EnumeratorCancellation]
-            CancellationToken cancellationToken = default
-    )
-    {
-        var fileName = Path.GetFileName(filePath);
-        ILogParser? parser = null;
+        CancellationToken cancellationToken = default
+    ) => ReadFromOffsetAsync(filePath, 0, cancellationToken);
 
-        await foreach (var (line, offset) in ReadLinesAsync(filePath, 0, cancellationToken))
-        {
-            if (string.IsNullOrWhiteSpace(line))
-                continue;
-
-            parser ??= _parserFactory.DetectParser(line);
-
-            var entry = parser.Parse(line, fileName, offset);
-            if (entry is not null)
-                yield return entry;
-        }
-    }
-
-    public async IAsyncEnumerable<LogEntry> ReadFromOffsetAsync(
+    /// <summary>
+    /// Reads every entry from <paramref name="startOffset"/> to the end of the file, including a
+    /// final line that has no line break yet.
+    /// </summary>
+    public IAsyncEnumerable<LogEntry> ReadFromOffsetAsync(
         string filePath,
         long startOffset,
-        [System.Runtime.CompilerServices.EnumeratorCancellation]
-            CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default
+    ) =>
+        ReadCoreAsync(
+            filePath,
+            startOffset,
+            long.MaxValue,
+            includeUnterminatedTail: true,
+            cursor: null,
+            cancellationToken
+        );
+
+    /// <summary>
+    /// Reads the entries made of complete lines in [<paramref name="startOffset"/>,
+    /// <paramref name="endOffset"/>). A final line without a line break is left alone — on a file
+    /// that is still being written it may be half an entry — and <paramref name="cursor"/> ends
+    /// up at the first byte not consumed, which is where the next read should start.
+    /// </summary>
+    internal IAsyncEnumerable<LogEntry> ReadRangeAsync(
+        string filePath,
+        long startOffset,
+        long endOffset,
+        ReadCursor cursor,
+        CancellationToken cancellationToken = default
     )
     {
-        var fileName = Path.GetFileName(filePath);
-        ILogParser? parser = null;
+        cursor.Position = startOffset;
+        return ReadCoreAsync(
+            filePath,
+            startOffset,
+            endOffset,
+            includeUnterminatedTail: false,
+            cursor,
+            cancellationToken
+        );
+    }
 
-        await foreach (var (line, offset) in ReadLinesAsync(filePath, startOffset, cancellationToken))
+    private async IAsyncEnumerable<LogEntry> ReadCoreAsync(
+        string filePath,
+        long startOffset,
+        long endOffset,
+        bool includeUnterminatedTail,
+        ReadCursor? cursor,
+        [EnumeratorCancellation] CancellationToken cancellationToken
+    )
+    {
+        var assembler = new EntryAssembler(_parserFactory, Path.GetFileName(filePath));
+        await using var lines = LogLineReader.Open(filePath, startOffset, endOffset);
+
+        while (true)
         {
-            if (string.IsNullOrWhiteSpace(line))
-                continue;
+            while (lines.TryReadLine(out var start, out var length, out var offset))
+            {
+                var entry = assembler.Feed(lines.Buffer, start, length, offset);
+                if (cursor is not null)
+                    cursor.Position = lines.Position;
+                if (entry is not null)
+                    yield return entry;
+            }
 
-            parser ??= _parserFactory.DetectParser(line);
+            if (!await lines.FillAsync(cancellationToken))
+                break;
+        }
 
-            var entry = parser.Parse(line, fileName, offset);
+        if (
+            includeUnterminatedTail
+            && lines.TryReadRemainder(out var tailStart, out var tailLength, out var tailOffset)
+        )
+        {
+            var entry = assembler.Feed(lines.Buffer, tailStart, tailLength, tailOffset);
+            if (cursor is not null)
+                cursor.Position = lines.Position;
             if (entry is not null)
                 yield return entry;
         }
+
+        var last = assembler.Flush();
+        if (last is not null)
+            yield return last;
     }
 
     /// <summary>
     /// Parses the entries that start at each of <paramref name="offsets"/>, through a single open
     /// stream, visiting offsets in ascending order. Returns one result per distinct offset; the
-    /// value is null when no parseable line starts there (file truncated or rewritten).
+    /// value is null when no parseable entry starts there (file truncated or rewritten).
+    /// <para>
+    /// Offsets that are close together are served from the same buffered block, so reading a page
+    /// or an export of neighbouring entries costs a handful of disk reads rather than one per
+    /// entry.
+    /// </para>
     /// </summary>
     public async Task<Dictionary<long, LogEntry?>> ReadEntriesAtOffsetsAsync(
         string filePath,
@@ -77,144 +136,205 @@ public sealed class StreamingLogFileReader
         if (offsets.Count == 0)
             return result;
 
+        var sorted = offsets.Distinct().ToArray();
+        Array.Sort(sorted);
+
         var fileName = Path.GetFileName(filePath);
         ILogParser? parser = null;
+        IMultiLineLogParser? multiLine = null;
+        StringBuilder? continuation = null;
 
-        await using var stream = new FileStream(
-            filePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete,
-            bufferSize: 65536,
-            useAsync: true
-        );
+        await using var lines = LogLineReader.Open(filePath, sequential: false);
+        var fileLength = lines.FileLength;
 
-        var buffer = new byte[65536];
-        var lineBytes = new MemoryStream();
-
-        foreach (var offset in offsets.Distinct().OrderBy(o => o))
+        foreach (var offset in sorted)
         {
-            if (offset < 0 || offset >= stream.Length)
+            result[offset] = null;
+            if (offset < 0 || offset >= fileLength)
+                continue;
+
+            lines.Seek(offset);
+            var line = await NextLineAsync(lines, cancellationToken);
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            if (parser is null)
             {
-                result[offset] = null;
+                parser = _parserFactory.DetectParser(line);
+                multiLine = parser as IMultiLineLogParser;
+            }
+
+            if (multiLine is null)
+            {
+                result[offset] = parser.Parse(line, fileName, offset);
                 continue;
             }
 
-            stream.Seek(offset, SeekOrigin.Begin);
-            lineBytes.SetLength(0);
+            if (!multiLine.IsEntryStart(line))
+                continue;
 
+            // The entry runs until the next line that starts one. That line is read here and then
+            // simply left behind: the next offset is repositioned from the buffer at no cost.
+            continuation?.Clear();
             while (true)
             {
-                var bytesRead = await stream.ReadAsync(buffer, cancellationToken);
-                if (bytesRead == 0)
+                var next = await NextLineAsync(lines, cancellationToken);
+                if (next is null || multiLine.IsEntryStart(next))
                     break;
+                if (string.IsNullOrWhiteSpace(next))
+                    continue;
 
-                var newline = Array.IndexOf(buffer, (byte)'\n', 0, bytesRead);
-                if (newline >= 0)
-                {
-                    lineBytes.Write(buffer, 0, newline);
+                continuation ??= new StringBuilder();
+                if (continuation.Length > 0)
+                    continuation.Append('\n');
+                continuation.Append(next);
+                if (continuation.Length >= MaxContinuationChars)
                     break;
-                }
-
-                lineBytes.Write(buffer, 0, bytesRead);
             }
 
-            if (lineBytes.Length == 0)
-            {
-                result[offset] = null;
-                continue;
-            }
-
-            var line = DecodeLine(lineBytes, trimCarriageReturn: true);
-            if (string.IsNullOrWhiteSpace(line))
-            {
-                result[offset] = null;
-                continue;
-            }
-
-            parser ??= _parserFactory.DetectParser(line);
-            result[offset] = parser.Parse(line, fileName, offset);
+            result[offset] = multiLine.Parse(
+                line,
+                continuation is { Length: > 0 } ? continuation.ToString() : null,
+                fileName,
+                offset
+            );
         }
 
         return result;
     }
 
-    private static async IAsyncEnumerable<(string Line, long Offset)> ReadLinesAsync(
+    /// <summary>The entry that starts exactly at <paramref name="offset"/>, or null.</summary>
+    internal async Task<LogEntry?> ReadEntryAtAsync(
         string filePath,
-        long startOffset,
-        [System.Runtime.CompilerServices.EnumeratorCancellation]
-            CancellationToken cancellationToken = default
+        long offset,
+        CancellationToken cancellationToken = default
     )
     {
-        await using var stream = new FileStream(
-            filePath,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete,
-            bufferSize: 65536,
-            useAsync: true
-        );
-
-        stream.Seek(startOffset, SeekOrigin.Begin);
-
-        var buffer = new byte[65536];
-        var lineBytes = new MemoryStream();
-        var lineStart = startOffset;
-        var position = startOffset;
-
-        int bytesRead;
-        while ((bytesRead = await stream.ReadAsync(buffer, cancellationToken)) > 0)
-        {
-            for (var i = 0; i < bytesRead; i++)
-            {
-                var value = buffer[i];
-                if (value == (byte)'\n')
-                {
-                    yield return (DecodeLine(lineBytes, trimCarriageReturn: true), lineStart);
-                    lineBytes.SetLength(0);
-                    lineStart = position + 1;
-                }
-                else
-                {
-                    lineBytes.WriteByte(value);
-                }
-
-                position++;
-            }
-        }
-
-        if (lineBytes.Length > 0)
-            yield return (DecodeLine(lineBytes, trimCarriageReturn: false), lineStart);
-    }
-
-    private static string DecodeLine(MemoryStream lineBytes, bool trimCarriageReturn)
-    {
-        var bytes = lineBytes.ToArray();
-        var length = bytes.Length;
-
-        if (trimCarriageReturn && length > 0 && bytes[length - 1] == (byte)'\r')
-            length--;
-
-        var offset = 0;
-        if (length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-        {
-            offset = 3;
-            length -= 3;
-        }
-
-        return Encoding.UTF8.GetString(bytes, offset, length);
+        var entries = await ReadEntriesAtOffsetsAsync(filePath, [offset], cancellationToken);
+        return entries.GetValueOrDefault(offset);
     }
 
     /// <summary>
-    /// Returns the offset of the first line boundary at or after <paramref name="targetOffset"/>.
-    /// <para>
-    /// Tail-first indexing starts reading from a byte offset chosen by size, which will usually
-    /// land mid-line. Reading from there would yield a truncated first line that the parser would
-    /// reject (or worse, misparse), so callers snap to the next real line start.
-    /// </para>
-    /// <para>
-    /// Returns the file length if no newline occurs after the target.
-    /// </para>
+    /// Chooses the parser for a file from its first non-blank line. Reads that start part-way
+    /// through a file (index slices, live tail) can land on a stack-trace line, which says nothing
+    /// about the file's format; the start of the file always does.
+    /// </summary>
+    internal async Task<ILogParser> DetectParserAsync(
+        string filePath,
+        CancellationToken cancellationToken = default
+    )
+    {
+        await using var lines = LogLineReader.Open(filePath);
+        while (true)
+        {
+            var line = await NextLineAsync(lines, cancellationToken);
+            if (line is null)
+                return _parserFactory.DetectParser(string.Empty);
+            if (!string.IsNullOrWhiteSpace(line))
+                return _parserFactory.DetectParser(line);
+        }
+    }
+
+    private static async ValueTask<string?> NextLineAsync(
+        LogLineReader lines,
+        CancellationToken cancellationToken
+    )
+    {
+        while (true)
+        {
+            if (lines.TryReadLine(out var start, out var length, out _))
+                return Encoding.UTF8.GetString(lines.Buffer, start, length);
+
+            if (!await lines.FillAsync(cancellationToken))
+            {
+                return lines.TryReadRemainder(out start, out length, out _)
+                    ? Encoding.UTF8.GetString(lines.Buffer, start, length)
+                    : null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Turns a stream of lines into entries. For a multi-line format an entry is only complete
+    /// once the next one starts (or the input ends), so each call returns the entry that the
+    /// given line finished, if any.
+    /// </summary>
+    private sealed class EntryAssembler
+    {
+        private readonly LogParserFactory _factory;
+        private readonly string _fileName;
+        private ILogParser? _parser;
+        private IMultiLineLogParser? _multiLine;
+        private string? _pendingLine;
+        private long _pendingOffset;
+        private StringBuilder? _continuation;
+
+        public EntryAssembler(LogParserFactory factory, string fileName)
+        {
+            _factory = factory;
+            _fileName = fileName;
+        }
+
+        public LogEntry? Feed(byte[] buffer, int start, int length, long offset)
+        {
+            if (LogLineReader.IsBlank(buffer.AsSpan(start, length)))
+                return null;
+
+            var line = Encoding.UTF8.GetString(buffer, start, length);
+            if (_parser is null)
+            {
+                _parser = _factory.DetectParser(line);
+                _multiLine = _parser as IMultiLineLogParser;
+            }
+
+            if (_multiLine is null)
+                return _parser.Parse(line, _fileName, offset);
+
+            if (_multiLine.IsEntryStart(line))
+            {
+                var completed = Flush();
+                _pendingLine = line;
+                _pendingOffset = offset;
+                return completed;
+            }
+
+            // A line that starts no entry belongs to the one before it. With no entry before it
+            // (the read began mid-entry) there is nothing to attach it to.
+            if (_pendingLine is not null)
+            {
+                _continuation ??= new StringBuilder();
+                if (_continuation.Length < MaxContinuationChars)
+                {
+                    if (_continuation.Length > 0)
+                        _continuation.Append('\n');
+                    _continuation.Append(line);
+                }
+            }
+
+            return null;
+        }
+
+        public LogEntry? Flush()
+        {
+            if (_pendingLine is null || _multiLine is null)
+                return null;
+
+            var entry = _multiLine.Parse(
+                _pendingLine,
+                _continuation is { Length: > 0 } ? _continuation.ToString() : null,
+                _fileName,
+                _pendingOffset
+            );
+
+            _pendingLine = null;
+            _continuation?.Clear();
+            return entry;
+        }
+    }
+
+    /// <summary>
+    /// Returns the offset of the first line boundary at or after <paramref name="targetOffset"/>,
+    /// or the file length if no line break occurs after the target.
     /// </summary>
     public static async Task<long> FindNextLineStartAsync(
         string filePath,
@@ -245,11 +365,9 @@ public sealed class StreamingLogFileReader
         int bytesRead;
         while ((bytesRead = await stream.ReadAsync(buffer, cancellationToken)) > 0)
         {
-            for (var i = 0; i < bytesRead; i++)
-            {
-                if (buffer[i] == (byte)'\n')
-                    return position + i + 1;
-            }
+            var newline = Array.IndexOf(buffer, (byte)'\n', 0, bytesRead);
+            if (newline >= 0)
+                return position + newline + 1;
             position += bytesRead;
         }
 
@@ -261,4 +379,10 @@ public sealed class StreamingLogFileReader
         var fi = new FileInfo(filePath);
         return fi.Exists ? fi.Length : 0;
     }
+}
+
+/// <summary>Where a ranged read stopped: the offset of the first byte it did not consume.</summary>
+internal sealed class ReadCursor
+{
+    public long Position { get; set; }
 }

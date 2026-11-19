@@ -8,6 +8,10 @@
 
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Serilog.Viewer.Core.Tests" />
+  </ItemGroup>
+
 
   <PropertyGroup>
     <TargetFrameworks>net8.0;net9.0</TargetFrameworks>

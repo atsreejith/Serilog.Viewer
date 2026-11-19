@@ -86,7 +86,7 @@ internal static class LogsHandler
         return Results.Empty;
     }
 
-    private static LogQuery BuildQuery(HttpRequest request, bool includeFullEntries = true)
+    internal static LogQuery BuildQuery(HttpRequest request, bool includeFullEntries = true)
     {
         var q = request.Query;
 

@@ -20,7 +20,7 @@ namespace Serilog.Viewer.Core.Tests;
 /// </summary>
 public class TailFirstIndexingTests : IDisposable
 {
-    // Must exceed LogFileIndexStore.TailFirstThresholdBytes (32 MB) to take the tail-first path.
+    // Must exceed LogFileIndexStore.ColdSyncBudgetBytes (32 MB) to take the tail-first path.
     private const int LargeFileEntries = 260_000;
 
     private readonly string _tempDir;

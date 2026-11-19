@@ -189,16 +189,21 @@ public sealed class LogFileWatcher : ILogFileWatcher, IDisposable
                 if (currentSize == tracked.Offset)
                     continue;
 
+                // Only complete lines, and only what existed when the size was sampled. The
+                // cursor ends up just past the last line reported, so the next pass starts on a
+                // line start and nothing is broadcast twice. A last line that has no line break
+                // yet is still being written: reporting it now would broadcast a cut-off entry
+                // and leave the next pass to start in the middle of it.
+                var cursor = new ReadCursor();
                 await foreach (
-                    var entry in _reader.ReadFromOffsetAsync(filePath, tracked.Offset)
+                    var entry in _reader.ReadRangeAsync(
+                        filePath,
+                        tracked.Offset,
+                        currentSize,
+                        cursor
+                    )
                 )
                 {
-                    // Only report what existed when the size was sampled; anything appended
-                    // since is picked up by the next pass from exactly that offset, so nothing
-                    // is broadcast twice.
-                    if (entry.LineOffset >= currentSize)
-                        break;
-
                     _logger.LogTrace(
                         "New log entry detected in {File}: [{Level}] {Message}",
                         filePath,
@@ -208,7 +213,7 @@ public sealed class LogFileWatcher : ILogFileWatcher, IDisposable
                     NewEntryDetected?.Invoke(this, entry);
                 }
 
-                tracked.Offset = currentSize;
+                tracked.Offset = cursor.Position;
             }
         }
         catch (Exception ex)
