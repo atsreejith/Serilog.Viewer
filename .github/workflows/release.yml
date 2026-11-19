@@ -1,0 +1,140 @@
+# Builds, tests and publishes the Serilog.Viewer package to nuget.org.
+#
+# Release: bump <Version> in src/Serilog.Viewer/Serilog.Viewer.csproj (and the React package.json),
+# commit, then push a matching tag:   git tag v1.3.4-preview.1 && git push origin v1.3.4-preview.1
+# A version with a suffix (-preview.1, -beta.2, ...) is published as a prerelease.
+#
+# Dry run: start the workflow by hand from the Actions tab. It builds, tests and packs, and
+# attaches the .nupkg to the run, but publishes nothing.
+#
+# Publishing uses nuget.org trusted publishing: no API key is stored anywhere. nuget.org needs a
+# trusted publishing policy for this repository with workflow file "release.yml", and the
+# repository needs a secret NUGET_USER holding the nuget.org profile name (not the email address).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # nuget.org trusted publishing
+
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      PUBLISH: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          # 9 builds the package; the tests run on 8.
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/Serilog.Viewer.React/package-lock.json
+
+      - name: Read package version
+        id: version
+        run: |
+          version=$(dotnet msbuild src/Serilog.Viewer/Serilog.Viewer.csproj -getProperty:Version)
+          echo "Package version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check the tag matches the package version
+        if: env.PUBLISH == 'true'
+        run: |
+          expected="v${{ steps.version.outputs.version }}"
+          if [[ "$GITHUB_REF_NAME" != "$expected" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in Serilog.Viewer.csproj (expected tag $expected)."
+            exit 1
+          fi
+
+      # The UI is built here, once, and the .NET builds below embed its output with
+      # SkipReactBuild=true. Letting the csproj build it as part of the pack does not work: the
+      # list of files to embed is taken before that build writes new hashed file names, and both
+      # target frameworks run it at the same time.
+      - name: Build UI
+        working-directory: src/Serilog.Viewer.React
+        run: |
+          npm ci
+          npm run build
+          test -f dist/index.html
+
+      - name: Test
+        run: dotnet test tests/Serilog.Viewer.Core.Tests -c Release -p:SkipReactBuild=true
+
+      - name: Pack
+        run: dotnet pack src/Serilog.Viewer/Serilog.Viewer.csproj -c Release -p:SkipReactBuild=true -o artifacts
+
+      - name: Check the package embeds the UI
+        run: |
+          package="artifacts/Serilog.Viewer.${{ steps.version.outputs.version }}.nupkg"
+          test -f "$package"
+          for tfm in net8.0 net9.0; do
+            unzip -p "$package" "lib/$tfm/Serilog.Viewer.dll" | grep -aq "Serilog.Viewer.wwwroot.index.html" \
+              || { echo "::error::lib/$tfm/Serilog.Viewer.dll does not embed the UI."; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+
+      - name: NuGet login (OIDC, short-lived API key)
+        if: env.PUBLISH == 'true'
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Publish to nuget.org
+        if: env.PUBLISH == 'true'
+        run: >
+          dotnet nuget push "artifacts/*.nupkg"
+          --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
+
+      - name: Create GitHub release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=(--generate-notes --verify-tag --title "$GITHUB_REF_NAME")
+          if [[ "${{ steps.version.outputs.prerelease }}" == "true" ]]; then
+            flags+=(--prerelease)
+          fi
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/*.nupkg --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/*.nupkg "${flags[@]}"
+          fi
